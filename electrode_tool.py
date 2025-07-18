@@ -136,6 +136,7 @@ if st.session_state.dilutions:
 
 # === Blade Height Tool ===
 st.header("Blade Height Recommender")
+st.markdown("Please note that this tool is still in early development, and may not have enough data to validate across different solid % contents")
 
 # === Electrode Mass Data ===
 colors = {'NaVP': 'blue', 'LVP': 'green', 'Li3V2(PO4)3': 'orange', 'Na3V2(PO4)3': 'red'}
