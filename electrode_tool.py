@@ -89,54 +89,114 @@ try:
 except Exception as e:
     st.error(f"Error calculating recipe: {e}")
 
-st.subheader("Oh crap, my slurry is too viscous")
-
-desired_solid_pct = st.number_input(
-    "Desired Solid Content After Dilution (%)", 
-    min_value=0.1, max_value=100.0, value=20.0, step=0.1,
-    help="Set target solid content after adding solvent to reduce viscosity."
-)
-
-if st.button("Calculate Required Additional Solvent"):
-    if recipe and desired_solid_pct < recipe["Initial Solid %"]:
-        total_solids = recipe["Total Solids (g)"]
-        total_slurry_mass = recipe["Total Slurry Mass (g)"]
-        
-        # Calculate required total slurry mass to get desired solid %
-        required_total_mass = total_solids / (desired_solid_pct / 100)
-        additional_solvent_needed = required_total_mass - total_slurry_mass
-        
-        if additional_solvent_needed > 0:
-            st.success(f"You need to add **{additional_solvent_needed:.4f} g** of additional solvent to reduce solid content to {desired_solid_pct:.2f}%.")
-        else:
-            st.info("No additional solvent needed; current solid content is already below desired level.")
-    else:
-        st.error("Please enter a desired solid % lower than the initial solid % and have a valid slurry recipe.")
-
-# === Dilution Tracking ===
-st.subheader("➕ Track Additional Solvent Dilutions")
+# === Initialize dilution state ===
 if "dilutions" not in st.session_state:
     st.session_state.dilutions = []
 
-new_dilution = st.number_input("Add Dilution Solvent (g)", value=0.0, key="dilution_input")
-if st.button("Add Dilution"):
-    if new_dilution > 0:
-        st.session_state.dilutions.append(new_dilution)
+st.subheader("Oh crap, my slurry is too viscous")
 
+# Initial dilution input
+initial_target_solid = st.number_input(
+    "Initial Desired Solid Content (%)", 
+    min_value=0.1, max_value=100.0, value=30.0, step=0.1,
+    key="initial_target_solid",
+    help="First target to reduce viscosity by lowering solid content."
+)
+
+if st.button("Calculate Required Additional Solvent"):
+    if recipe and initial_target_solid < recipe["Initial Solid %"]:
+        total_solids = recipe["Total Solids (g)"]
+        original_mass = recipe["Total Slurry Mass (g)"]
+
+        new_total_mass = total_solids / (initial_target_solid / 100)
+        added_solvent = new_total_mass - original_mass
+
+        st.session_state.dilutions.append(added_solvent)
+        st.success(f"Add **{added_solvent:.4f} g** solvent to reach {initial_target_solid:.2f}% solids.")
+    else:
+        st.error("Enter a desired solid % lower than the original value and ensure recipe is valid.")
+
+# === Still Too Viscous ===
+st.subheader("Crap, my slurry is STILL too viscous ")
+
+further_target_solid = st.number_input(
+    "New Target Solid Content (%)",
+    min_value=0.1, max_value=100.0, value=25.0, step=0.1,
+    key="further_target_solid",
+    help="Use this if you've already diluted once, but it's still too thick."
+)
+
+if st.button("Recalculate Additional Solvent for New Target"):
+    if recipe:
+        total_solids = recipe["Total Solids (g)"]
+        current_mass = recipe["Total Slurry Mass (g)"] + sum(st.session_state.dilutions)
+        current_solid_pct = (total_solids / current_mass) * 100
+
+        if further_target_solid < current_solid_pct:
+            required_mass = total_solids / (further_target_solid / 100)
+            additional_solvent = required_mass - current_mass
+
+            st.session_state.dilutions.append(additional_solvent)
+            st.success(f"Add **{additional_solvent:.4f} g** more solvent to reach {further_target_solid:.2f}% solids.")
+        else:
+            st.info(f"You're already below {further_target_solid:.2f}% solids. No further solvent needed.")
+    else:
+        st.error("No valid slurry recipe to adjust.")
+
+# === Optional Reset Button ===
+if st.button("🔄 Reset All Dilutions"):
+    st.session_state.dilutions = []
+    st.success("Dilution history reset.")
+
+# === Show Total Dilutions and New Solid % ===
 if st.session_state.dilutions:
-    for i, val in enumerate(st.session_state.dilutions):
-        st.write(f"Dilution {i+1}: {val:.3f} g")
+    st.subheader("➕ Dilution History")
 
-    # Recalculate new solid %
+    for i, amt in enumerate(st.session_state.dilutions):
+        st.write(f"Dilution {i+1}: {amt:.4f} g")
+
     total_solids = recipe["Total Solids (g)"]
-    total_mass_with_dilutions = recipe["Total Slurry Mass (g)"] + sum(st.session_state.dilutions)
-    new_solid_pct = (total_solids / total_mass_with_dilutions) * 100
+    total_mass = recipe["Total Slurry Mass (g)"] + sum(st.session_state.dilutions)
+    new_solid_pct = (total_solids / total_mass) * 100
 
-    st.markdown(f"New Solid Content After Dilutions: **{new_solid_pct:.2f}%**")
+    st.markdown(f"**Total Solvent Added:** {sum(st.session_state.dilutions):.4f} g")
+    st.markdown(f"**New Solid Content:** {new_solid_pct:.2f}%")
+
+# === True Recipe Tracker (Actual Measured Inputs) ===
+st.subheader("True Slurry Recipe Tracker (Post-Mixing Actual Measurements)")
+
+col1, col2 = st.columns(2)
+with col1:
+    actual_active_mass = st.number_input("Measured Active Material Mass (g)", min_value=0.0, step=0.0001)
+    actual_carbon_mass = st.number_input("Measured Carbon Mass (g)", min_value=0.0, step=0.00001)
+with col2:
+    actual_binder_mass = st.number_input("Measured Binder Mass (g)", min_value=0.0, step=0.00001)
+    actual_solvent_mass = st.number_input("Measured Solvent Mass (g)", min_value=0.0, step=0.00001)
+
+if any(m > 0 for m in [actual_active_mass, actual_carbon_mass, actual_binder_mass, actual_solvent_mass]):
+    total_solids = actual_active_mass + actual_carbon_mass + actual_binder_mass
+    total_slurry = total_solids + actual_solvent_mass
+    solid_pct = (total_solids / total_slurry) * 100 if total_slurry > 0 else 0.0
+
+    # Individual percentages (based on total solids)
+    active_pct = (actual_active_mass / total_solids) * 100 if total_solids > 0 else 0.0
+    carbon_pct = (actual_carbon_mass / total_solids) * 100 if total_solids > 0 else 0.0
+    binder_pct = (actual_binder_mass / total_solids) * 100 if total_solids > 0 else 0.0
+
+    st.markdown("Actual Slurry Composition")
+    st.markdown(f"- **Total Slurry Mass:** `{total_slurry:.4f} g`")
+    st.markdown(f"- **Total Solids:** `{total_solids:.4f} g`")
+    st.markdown(f"- **Solid Content:** `{solid_pct:.3f}%`")
+    st.markdown(f"- **Active Material % of Solids:** `{active_pct:.3f}%`")
+    st.markdown(f"- **Carbon % of Solids:** `{carbon_pct:.3f}%`")
+    st.markdown(f"- **Binder % of Solids:** `{binder_pct:.3f}%`")
+else:
+    st.info("Enter actual measured masses to calculate the true recipe.")
 
 # === Blade Height Tool ===
 st.header("Blade Height Recommender")
-st.markdown("Please note that this tool is still in early development, and may not have enough data to validate across different solid % contents")
+st.markdown("Please note that this tool is still in early development, and may not have enough data to validate")
+
 
 # === Electrode Mass Data ===
 colors = {'NaVP': 'blue', 'LVP': 'green', 'Li3V2(PO4)3': 'orange', 'Na3V2(PO4)3': 'red'}
