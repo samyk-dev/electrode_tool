@@ -46,7 +46,7 @@ if tool_choice == "Slurry Calculator":
         }
 
     # === App Layout ===
-    st.title("Battery Lab Tool: Slurry + Blade Height")
+    st.title("Battery Lab Tool: Slurry Recipe Calculator")
     st.markdown("Designed for cathode electrode slurry and coating optimization.")
 
     st.header("Electrode Slurry Recipe")
@@ -279,7 +279,7 @@ if tool_choice == "Blade Height Recommender":
     import matplotlib.pyplot as plt
     from scipy.stats import linregress
 
-    st.header("Blade Height Recommender")
+    st.header("Battery Lab Tool: Blade Height Recommender")
     st.markdown("Please note that this tool is still in early development, and may not have enough data to validate")
 
     # === Constants ===
@@ -429,7 +429,7 @@ if tool_choice == "Capacity Match Tool":
     import matplotlib.pyplot as plt
     from scipy.stats import linregress
 
-    st.header("Capacity Match Tool")
+    st.header("Battery Lab Tool: Battery Capacity Match Tool")
     st.markdown("Match cathode and anode capacities based on desired ratio and calculate required blade height.")
 
     # === Constants ===
