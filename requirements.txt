@@ -2,3 +2,15 @@ streamlit
 matplotlib
 numpy
 scipy
+io
+os
+math
+json
+numpy
+pandas
+linregress
+xlsxwriter
+fpdf
+mpl_toolkits
+Axes3D
+plotly.express
