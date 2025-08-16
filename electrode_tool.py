@@ -19,6 +19,9 @@ from fpdf import FPDF
 import mpl_toolkits
 from mpl_toolkits.mplot3d import Axes3D
 import plotly.express as px
+import plotly.graph_objects as go
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+from io import BytesIO
 
 # =========================
 # Global Config
@@ -249,150 +252,176 @@ tool = st.sidebar.radio(
 # =========================
 # Slurry Calculator
 # =========================
+
 def slurry_calculator():
     st.title("Slurry Calculator")
-    st.caption("Designed for cathode/anode slurry and coating planning.")
+    st.caption("Cathode/Anode slurry planning with true recipe tracking, multi-component breakdown, and dilution history.")
 
+    # ---- Column 1: Formula & Mass Targets ----
     col1, col2 = st.columns(2, gap="large")
     with col1:
         st.subheader("Formula (must sum to 100%)")
-        active_ratio = st.number_input("Active Material % in Formula", min_value=0.0, max_value=100.0, value=96.0, step=0.1)
-        carbon_ratio = st.number_input("Conductive Carbon % in Formula", min_value=0.0, max_value=100.0, value=2.0, step=0.1)
-        binder_ratio = st.number_input("Binder % in Formula", min_value=0.0, max_value=100.0, value=2.0, step=0.1)
+        active_ratio = st.number_input("Active Material % in Formula", 0.0, 100.0, 96.0, 0.1)
+        carbon_ratio = st.number_input("Conductive Carbon % in Formula", 0.0, 100.0, 2.0, 0.1)
+        binder_ratio = st.number_input("Binder % in Formula", 0.0, 100.0, 2.0, 0.1)
         total_ratio = active_ratio + carbon_ratio + binder_ratio
         if abs(total_ratio - 100.0) > 0.01:
             st.error(f"Mass ratio must add to 100%. Current: {total_ratio:.2f}%")
             st.stop()
 
-        active_mass = st.number_input("Active Material Mass target (g)", min_value=0.0, step=0.01, value=1.0)
-        use_solution = st.checkbox("Using Binder Solution?", value=True)
-        binder_solution_pct = st.number_input("Binder % in Solution", min_value=0.1, max_value=100.0, value=5.0)
-        solid_pct = st.number_input("Target Solid Content (%)", min_value=0.1, max_value=100.0, value=30.0)
+        target_mode = st.radio("Target Mode", ["Active Mass (g)", "Total Slurry Mass (g)"])
+        if target_mode == "Active Mass (g)":
+            active_mass = st.number_input("Active Material Mass (g)", 0.0, step=0.01, value=1.0)
+        else:
+            total_slurry_mass = st.number_input("Total Slurry Mass (g)", 0.0, step=0.01, value=10.0)
+
+        use_solution = st.checkbox("Using Binder Solution?", True)
+        binder_solution_pct = None
+        if use_solution:
+            binder_solution_pct = st.number_input("Binder % in Solution", 0.1, 100.0, 5.0)
+
+        solid_pct = st.number_input("Target Solid Content (%)", 0.1, 100.0, 30.0)
+
+    # ---- Component breakdown function ----
+    def get_components(name, default_names, default_weights):
+        multi = st.checkbox(f"{name} has multiple components?", value=False, key=f"{name}_multi")
+        n = st.number_input(f"Number of {name} components", 1, 10, value=len(default_names), key=f"{name}_count") if multi else 1
+        names, weights = [], []
+        for i in range(n):
+            nm = st.text_input(f"{name} #{i+1} name", value=default_names[i] if i < len(default_names) else "", key=f"{name}_{i}_nm")
+            wt = st.number_input(f"{name} #{i+1} %", 0.0, 100.0, value=default_weights[i] if i < len(default_weights) else 100.0/n, step=0.1, key=f"{name}_{i}_wt")
+            names.append(nm)
+            weights.append(wt)
+        if abs(sum(weights) - 100.0) > 0.01:
+            st.error(f"{name} splits must total 100%. Current: {sum(weights):.2f}%")
+            return None, None
+        return names, weights
 
     with col2:
-        st.subheader("Multi-component details (optional)")
-        st.caption("Percent splits inside each bucket must sum to 100%")
-        def get_mix(name, defaults):
-            st.markdown(f"**{name} components**")
-            n = st.number_input(f"Number of {name} components", 1, 5, value=len(defaults), key=f"{name}_count")
-            names, weights = [], []
-            for i in range(n):
-                c1, c2 = st.columns(2)
-                with c1:
-                    nm = st.text_input(f"{name} #{i+1} name", value=defaults[i][0] if i < len(defaults) else "", key=f"{name}_{i}_nm")
-                with c2:
-                    wt = st.number_input(f"{name} #{i+1} %", 0.0, 100.0, value=defaults[i][1] if i < len(defaults) else 0.0, step=0.1, key=f"{name}_{i}_wt")
-                names.append(nm)
-                weights.append(wt)
-            if abs(sum(weights) - 100.0) > 0.01:
-                st.error(f"{name} splits must total 100%. Current: {sum(weights):.2f}%")
-                return None, None
-            return names, weights
-
-        active_names, active_weights = get_mix("Active", [("NVP", 100.0)])
-        carbon_names, carbon_weights = get_mix("Carbon", [("Super P", 100.0)])
-        binder_names, binder_weights = get_mix("Binder", [("CMC", 60.0), ("SBR", 40.0)])
-        if None in (active_weights, carbon_weights, binder_weights):
+        st.subheader("Component Details")
+        active_names, active_weights = get_components("Active", ["NVP"], [100.0])
+        carbon_names, carbon_weights = get_components("Carbon", ["Super P"], [100.0])
+        binder_names, binder_weights = get_components("Binder", ["CMC"], [100.0])
+        solvent_names, solvent_weights = get_components("Solvent", ["NMP"], [100.0])
+        if None in (active_names, carbon_names, binder_names, solvent_names):
             st.stop()
 
-    # Compute slurry
-    active_frac = active_ratio / 100.0
-    carbon_frac = carbon_ratio / 100.0
-    binder_frac = binder_ratio / 100.0
+    # ---- Compute masses ----
+    active_frac, carbon_frac, binder_frac = active_ratio/100, carbon_ratio/100, binder_ratio/100
+    if target_mode == "Active Mass (g)":
+        carbon_mass = (carbon_frac / active_frac) * active_mass if active_frac > 0 else 0
+        binder_mass = (binder_frac / active_frac) * active_mass if active_frac > 0 else 0
+        total_solids = active_mass + carbon_mass + binder_mass
+        total_slurry_mass = total_solids / (solid_pct / 100.0)
+    else:
+        total_solids = total_slurry_mass * (solid_pct / 100.0)
+        active_mass = (active_frac / (active_frac + carbon_frac + binder_frac)) * total_solids
+        carbon_mass = (carbon_frac / active_frac) * active_mass if active_frac > 0 else 0
+        binder_mass = total_solids - active_mass - carbon_mass
 
-    carbon_mass = (carbon_frac / active_frac) * active_mass if active_frac > 0 else 0.0
-    binder_mass = (binder_frac / active_frac) * active_mass if active_frac > 0 else 0.0
-    binder_solution_mass = binder_mass / (binder_solution_pct / 100.0) if use_solution else binder_mass
+    binder_solution_mass = binder_mass / (binder_solution_pct/100.0) if use_solution else binder_mass
+    solvent_pure_mass = total_slurry_mass - total_solids - (binder_solution_mass - binder_mass if use_solution else 0)
+    solvent_in_binder = binder_solution_mass - binder_mass if use_solution else 0
+    solvent_total_combined = solvent_pure_mass + solvent_in_binder
 
-    total_solids = active_mass + carbon_mass + binder_mass
-    total_slurry_mass = total_solids / (solid_pct / 100.0)
-    solvent_mass = total_slurry_mass - total_solids
-
-    disp = {
+    # ---- Display recipe ----
+    st.subheader("Initial Slurry Recipe")
+    recipe_dict = {
         "Active Mass (g)": active_mass,
         "Carbon Mass (g)": carbon_mass,
         "Binder Mass (g)": binder_mass,
         "Binder Solution Mass (g)": binder_solution_mass if use_solution else None,
-        "Solvent Mass (g)": solvent_mass,
+        "Solvent Mass Total (g)": solvent_total_combined,
+        "Solvent Pure (g)": solvent_pure_mass,
+        "Solvent in Binder Solution (g)": solvent_in_binder,
         "Total Solids (g)": total_solids,
         "Total Slurry Mass (g)": total_slurry_mass,
-        "Initial Solid %": solid_pct,
     }
-    clean = {k: v for k, v in disp.items() if v is not None}
-    df = pd.DataFrame.from_dict({k: round(v, 4) for k, v in clean.items()}, orient="index", columns=["Mass (g)"])
-    st.subheader("Initial Slurry Recipe")
-    st.table(df)
+    clean_dict = {k:v for k,v in recipe_dict.items() if v is not None}
+    df_recipe = pd.DataFrame.from_dict({k: round(v,4) for k,v in clean_dict.items()}, orient="index", columns=["Mass (g)"])
+    st.table(df_recipe)
 
-    if use_solution and binder_weights:
-        st.markdown("**Binder composition breakdown:**")
-        for name, wt in zip(binder_names, binder_weights):
-            bm = binder_mass * (wt / 100.0)
-            st.markdown(f"- {name}: **{bm:.4f} g**")
+    st.subheader("Component Mass Breakdown")
+    def display_breakdown(names, weights, total_mass, label):
+        st.markdown(f"**{label} components:**")
+        for nm, wt in zip(names, weights):
+            st.markdown(f"- {nm}: {total_mass*wt/100:.4f} g")
+    display_breakdown(active_names, active_weights, active_mass, "Active")
+    display_breakdown(carbon_names, carbon_weights, carbon_mass, "Carbon")
+    display_breakdown(binder_names, binder_weights, binder_mass, "Binder")
+    display_breakdown(solvent_names, solvent_weights, solvent_total_combined, "Solvent (total)")
 
-    # Dilution helper
-    if "dilutions" not in st.session_state:
-        st.session_state.dilutions = []
-    st.subheader("Dilution Helper")
-    init_target = st.number_input("First desired solid content (%)", 0.1, 100.0, value=solid_pct, step=0.1)
-    if st.button("Compute solvent to add"):
-        if init_target < solid_pct:
-            new_total = total_solids / (init_target / 100.0)
-            add_solvent = new_total - total_slurry_mass
-            st.session_state.dilutions.append(add_solvent)
-            st.success(f"Add {add_solvent:.4f} g solvent to reach {init_target:.2f}% solids.")
-        else:
-            st.error("Desired solid % must be lower than current.")
+    # ---- True Recipe Tracker ----
+    track_true = st.checkbox("Track True Recipe?")
+    true_recipe = {}
+    if track_true:
+        st.subheader("Input Actual Masses")
+        for k in clean_dict.keys():
+            val = st.number_input(f"Actual {k}", value=clean_dict[k], step=0.01)
+            true_recipe[k] = val
+        st.markdown("**Actual component breakdown**")
+        display_breakdown(active_names, active_weights, true_recipe['Active Mass (g)'], "Active")
+        display_breakdown(carbon_names, carbon_weights, true_recipe['Carbon Mass (g)'], "Carbon")
+        display_breakdown(binder_names, binder_weights, true_recipe['Binder Mass (g)'], "Binder")
+        display_breakdown(solvent_names, solvent_weights, true_recipe['Solvent Mass Total (g)'], "Solvent (total)")
 
-    next_target = st.number_input("New target solid content after first dilution (%)", 0.1, 100.0, value=max(solid_pct-5, 0.1), step=0.1)
-    if st.button("Recalculate for new target"):
-        cur_mass = total_slurry_mass + sum(st.session_state.dilutions)
-        cur_solid = (total_solids / cur_mass) * 100.0
-        if next_target < cur_solid:
-            req_mass = total_solids / (next_target / 100.0)
-            add_more = req_mass - cur_mass
-            st.session_state.dilutions.append(add_more)
-            st.success(f"Add {add_more:.4f} g more solvent to reach {next_target:.2f}% solids.")
-        else:
-            st.info("Already below that solid %. No addition needed.")
+    # ---- Dilution history tracker ----
+    st.subheader("Dilution Tool")
+    if 'dilution_history' not in st.session_state:
+        st.session_state.dilution_history = []
 
-    if st.button("Reset dilutions"):
-        st.session_state.dilutions = []
-    if st.session_state.dilutions:
-        st.markdown("**Dilution history:**")
-        for i, a in enumerate(st.session_state.dilutions, 1):
-            st.write(f"Dilution {i}: {a:.4f} g")
-        t_mass = total_slurry_mass + sum(st.session_state.dilutions)
-        new_solid = (total_solids / t_mass) * 100.0
-        st.markdown(f"**Total solvent added:** {sum(st.session_state.dilutions):.4f} g")
-        st.markdown(f"**New solid content:** {new_solid:.2f}%")
+    new_solid_pct = st.number_input("New Solid % (must be <= original)", 0.1, solid_pct, value=solid_pct)
 
-    # True recipe tracker
-    st.subheader("True Slurry Recipe Tracker (Measured)")
-    c1, c2 = st.columns(2)
-    with c1:
-        m_act = st.number_input("Measured Active (g)", 0.0, step=0.0001)
-        m_car = st.number_input("Measured Carbon (g)", 0.0, step=0.0001)
-    with c2:
-        m_bin = st.number_input("Measured Binder (g)", 0.0, step=0.0001)
-        m_sol = st.number_input("Measured Solvent (g)", 0.0, step=0.0001)
+    if new_solid_pct < solid_pct:
+        # Calculate additional solvent needed
+        current_total_slurry = total_slurry_mass
+        new_total_slurry = total_solids / (new_solid_pct / 100.0)
+        additional_solvent = new_total_slurry - current_total_slurry
+        st.session_state.dilution_history.append(additional_solvent)
+        st.success(f"Add {additional_solvent:.4f} g of solvent to reach {new_solid_pct}% solids.")
+    st.write("Dilution history (g solvent added):", st.session_state.dilution_history)
 
-    if any(v > 0 for v in [m_act, m_car, m_bin, m_sol]):
-        t_solids = m_act + m_car + m_bin
-        t_slurry = t_solids + m_sol
-        solid_pc = (t_solids / t_slurry) * 100.0 if t_slurry > 0 else 0.0
-        a_pc = (m_act / t_solids) * 100.0 if t_solids > 0 else 0.0
-        c_pc = (m_car / t_solids) * 100.0 if t_solids > 0 else 0.0
-        b_pc = (m_bin / t_solids) * 100.0 if t_solids > 0 else 0.0
-        st.markdown("**Actual Slurry Composition**")
-        st.markdown(f"- Total Slurry Mass: `{t_slurry:.4f} g`")
-        st.markdown(f"- Total Solids: `{t_solids:.4f} g`")
-        st.markdown(f"- Solid Content: `{solid_pc:.3f}%`")
-        st.markdown(f"- Active % of Solids: `{a_pc:.3f}%`")
-        st.markdown(f"- Carbon % of Solids: `{c_pc:.3f}%`")
-        st.markdown(f"- Binder % of Solids: `{b_pc:.3f}%`")
-    else:
-        st.info("Enter measured masses to compute actual composition.")
 
+    # ---- Export to Excel ----
+    if st.button("Export Recipe to Excel"):
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+            # Original recipe
+            df_recipe.to_excel(writer, sheet_name="Recipe")
+            
+            # True recipe (if tracked)
+            if track_true:
+                df_actual = pd.DataFrame.from_dict({k: [v] for k,v in true_recipe.items()})
+                df_actual.to_excel(writer, sheet_name="Actual Recipe")
+            
+            # Dilution history
+            if st.session_state.dilution_history:
+                dilution_data = {
+                    f"Dilution {i+1}": [v] for i, v in enumerate(st.session_state.dilution_history)
+                }
+                df_dilution = pd.DataFrame(dilution_data)
+                df_dilution.to_excel(writer, sheet_name="Dilution History")
+
+            # Optional: Combined visualization sheet
+            # Create a sheet with total solvent, total solids, and cumulative dilution
+            combined_data = {
+                "Total Solids (g)": [total_solids],
+                "Total Slurry Mass (g)": [total_slurry_mass],
+                "Initial Solvent Mass (g)": [solvent_total_combined],
+                "Cumulative Added Solvent (g)": [sum(st.session_state.dilution_history)]
+            }
+            df_combined = pd.DataFrame(combined_data)
+            df_combined.to_excel(writer, sheet_name="Combined Overview")
+
+        st.download_button(
+            label="Download Excel",
+            data=buffer.getvalue(),
+            file_name="slurry_recipe.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        
+    # ---- Slurry Calculation Details Expander ----
     with st.expander("📘 Slurry Calculation Details"):
         st.markdown("### Slurry Composition Formulas")
         st.markdown(f"""
@@ -400,46 +429,46 @@ def slurry_calculator():
         - Active Material %: {active_ratio}%
         - Carbon %: {carbon_ratio}%
         - Binder %: {binder_ratio}%
-        - Active Material Mass: {active_mass} g
-        - Binder Solution %: {binder_solution_pct}% ({"used" if use_solution else "not used"})
+        - Active Material Mass: {active_mass:.4f} g
+        - Binder Solution %: {binder_solution_pct if use_solution else 'N/A'}% ({'used' if use_solution else 'not used'})
         - Target Solid %: {solid_pct}%
         """)
-        
+
         st.markdown("**Calculations:**")
         st.markdown(f"""
         1. Carbon Mass = (Carbon % / Active %) × Active Mass  
-           = ({carbon_ratio} / {active_ratio}) × {active_mass}  
-           = {carbon_mass:.4f} g
-           
-        2. Binder Mass = (Binder % / Active %) × Active Mass  
-           = ({binder_ratio} / {active_ratio}) × {active_mass}  
-           = {binder_mass:.4f} g
-           
-        3. Binder Solution Mass = Binder Mass / (Binder Solution % / 100)  
-           = {binder_mass:.4f} / ({binder_solution_pct}/100)  
-           = {binder_solution_mass:.4f} g
-           
-        4. Total Solids = Active + Carbon + Binder  
-           = {active_mass:.4f} + {carbon_mass:.4f} + {binder_mass:.4f}  
-           = {total_solids:.4f} g
-           
-        5. Total Slurry Mass = Total Solids / (Solid % / 100)  
-           = {total_solids:.4f} / ({solid_pct}/100)  
-           = {total_slurry_mass:.4f} g
-           
-        6. Solvent Mass = Total Slurry Mass - Total Solids  
-           = {total_slurry_mass:.4f} - {total_solids:.4f}  
-           = {solvent_mass:.4f} g
-        """)
+        = ({carbon_ratio} / {active_ratio}) × {active_mass:.4f}  
+        = {carbon_mass:.4f} g
         
+        2. Binder Mass = (Binder % / Active %) × Active Mass  
+        = ({binder_ratio} / {active_ratio}) × {active_mass:.4f}  
+        = {binder_mass:.4f} g
+        
+        3. Binder Solution Mass = {'Binder Mass / (Binder Solution % / 100)' if use_solution else 'N/A'}  
+        = {binder_solution_mass:.4f} g
+        
+        4. Total Solids = Active + Carbon + Binder  
+        = {active_mass:.4f} + {carbon_mass:.4f} + {binder_mass:.4f}  
+        = {total_solids:.4f} g
+        
+        5. Total Slurry Mass = Total Solids / (Solid % / 100)  
+        = {total_solids:.4f} / ({solid_pct}/100)  
+        = {total_slurry_mass:.4f} g
+        
+        6. Solvent Mass = Total Slurry Mass - Total Solids  
+        = {total_slurry_mass:.4f} - {total_solids:.4f}  
+        = {solvent_total_combined:.4f} g
+        """)
+
         if use_solution and binder_weights:
             st.markdown("**Binder Composition Breakdown:**")
             for name, wt in zip(binder_names, binder_weights):
                 bm = binder_mass * (wt / 100.0)
                 st.markdown(f"""
                 - {name}: {wt}% of binder → {bm:.4f} g  
-                  Calculation: {binder_mass:.4f} × ({wt}/100) = {bm:.4f} g
+                Calculation: {binder_mass:.4f} × ({wt}/100) = {bm:.4f} g
                 """)
+
 
 # =========================
 # Blade Height Recommender (DB-aware)
@@ -815,275 +844,306 @@ def capacity_match_tool():
             
             Final Blade Height = {req_tick:.2f} × 10 = {req_um:.1f} µm
             """)
+
+
 # =========================
-# Enhanced Coating Calibration Tool
+# Coating Calibration Tool
 # =========================
+
 def coating_calibration_tool():
     st.title("Coating Calibration Tool")
-    st.markdown("""
-    Create a custom coating matrix to visualize coating uniformity. 
-    Enter parameters for each position and measured masses to generate interactive heatmaps.
-    """)
-    
-    # Batch Mode Configuration
-    batch_mode = st.checkbox("Enable Batch Mode (Compare Multiple Coating Runs)")
+    st.markdown("Create a custom coating matrix to visualize coating uniformity.")
+
+    batch_mode = st.checkbox(
+        "Enable Batch Mode (Compare Multiple Coating Runs)",
+        help="Toggle to allow input of multiple batches for comparison."
+    )
+    n_batches = st.number_input("Number of batches", 1, 5, 1, step=1) if batch_mode else 1
+
+    n_rows = st.number_input("Number of rows", 1, 10, 3, step=1, help="Number of rows in your coating matrix.")
+    n_cols = st.number_input("Number of columns", 1, 10, 3, step=1, help="Number of columns in your coating matrix.")
+
+    # Global Parameters in Expander
+    with st.expander("Global Parameters", expanded=False):
+        g_active = st.text_input("Active Material", "LVP", help="Name of the active material used.")
+        g_substrate = st.text_input("Substrate", "Aluminum foil", help="Type of substrate being coated.")
+        g_diameter = st.number_input(
+            "Diameter (mm)", 0.1, 100.0, 13.0, step=0.00001, format="%.5f",
+            help="Diameter of the coated disc in mm."
+        )
+        g_solid = st.number_input(
+            "Solid (%)", 0.0, 100.0, 30.0, step=0.00001, format="%.5f",
+            help="Solid content of the coating solution."
+        )
+        g_active_pct = st.number_input(
+            "Active Material (%)", 0.0, 100.0, 96.0, step=0.00001, format="%.5f",
+            help="Percentage of active material in the solid content."
+        )
+        g_blade = st.number_input(
+            "Blade Height (µm)", 1, 1000, 200, step=1,
+            help="Height of the coating blade used for spreading."
+        )
+
+    sensitivity = st.slider(
+        "Heatmap Sensitivity (%)", 1, 100, 10,
+        help="Controls how sensitive the heatmap colors are to deviations."
+    )
+
+    # Heatmap mode selection
+    heatmap_mode = st.radio(
+        "Select Heatmap Type",
+        ["Deviation", "Critical Deviation", "Spec/Out-of-Spec"],
+        help="Select the type of heatmap to display: "
+             "Deviation shows % deviation from mean; "
+             "Critical Deviation highlights cells exceeding the critical threshold; "
+             "Spec/Out-of-Spec highlights cells outside the specification range."
+    )
+
+    # Show relevant flag input based on selected heatmap mode
+    if heatmap_mode == "Critical Deviation":
+        crit_value = st.number_input(
+            "Critical Deviation (%)",
+            0.0, 100.0, 5.0, step=0.1,
+            help="Cells with deviation from mean exceeding this percentage will be flagged."
+        )
+    elif heatmap_mode == "Spec/Out-of-Spec":
+        spec_min = st.number_input(
+            "Spec Min Active ML (mg/cm²)",
+            0.0, 10.0, 1.5, step=0.01,
+            help="Minimum acceptable active ML; below this will be flagged."
+        )
+        spec_max = st.number_input(
+            "Spec Max Active ML (mg/cm²)",
+            0.0, 10.0, 2.5, step=0.01,
+            help="Maximum acceptable active ML; above this will be flagged."
+        )
+
     batches = []
-    
-    if batch_mode:
-        n_batches = st.number_input("Number of batches", 1, 5, 1, step=1)
-    
-    # Matrix configuration
-    st.subheader("Matrix Configuration")
-    cols = st.columns(2)
-    with cols[0]:
-        n_rows = st.number_input("Number of rows", 1, 10, 3, step=1)
-    with cols[1]:
-        n_cols = st.number_input("Number of columns", 1, 10, 3, step=1)
-    
-    # Global parameters (can be overridden per cell)
-    st.subheader("Global Parameters (defaults for all cells)")
-    with st.expander("Set Global Parameters"):
-        g_active = st.text_input("Active Material", "LVP")
-        g_substrate = st.text_input("Substrate", "Aluminum foil")
-        g_diameter = st.number_input("Diameter (mm)", 0.1, 100.0, 13.0, step=0.00001, format="%.5f")
-        g_solid = st.number_input("Solid %", 0.0, 100.0, 30.0, step=0.00001, format="%.5f")
-        g_active_pct = st.number_input("Active Material %", 0.0, 100.0, 96.0, step=0.00001, format="%.5f")
-        g_blade = st.number_input("Blade Height (µm)", 1, 1000, 200, step=1)
-    
-    # Heatmap sensitivity settings
-    st.subheader("Heatmap Sensitivity")
-    sensitivity = st.slider("Color scale sensitivity (%)", 1, 100, 10, 
-                          help="Higher values show smaller variations more dramatically")
-    
-    # Batch processing loop
-    for batch_num in range(n_batches if batch_mode else 1):
+    for batch_num in range(n_batches):
         if batch_mode:
             st.subheader(f"Batch {batch_num + 1}")
-            with st.expander(f"Batch {batch_num + 1} Parameters", expanded=True):
-                pass  # Could add batch-specific parameters here
-        
-        # Create the matrix grid
-        st.subheader("Coating Matrix Setup" + (f" - Batch {batch_num + 1}" if batch_mode else ""))
+        use_global_batch = st.checkbox(f"Use global parameters for Batch {batch_num+1}", True)
+
         matrix = {}
         for row in range(n_rows):
-            cols = st.columns(n_cols + 1)  # +1 for row label
-            with cols[0]:
+            cols_layout = st.columns(n_cols + 1)
+            with cols_layout[0]:
                 st.markdown(f"**Row {row+1}**")
-            
             for col in range(n_cols):
-                with cols[col+1]:
-                    with st.container(border=True):
-                        st.markdown(f"**Position {row+1}-{col+1}**")
-                        
-                        # Cell parameters
-                        use_global = st.checkbox("Use global", True, key=f"glob_{batch_num}_{row}_{col}")
-                        if not use_global:
-                            active = st.text_input("Active Material", g_active, key=f"act_{batch_num}_{row}_{col}")
-                            substrate = st.text_input("Substrate", g_substrate, key=f"sub_{batch_num}_{row}_{col}")
-                            diameter = st.number_input("Diameter (mm)", 0.1, 100.0, g_diameter, 
-                                                     step=0.00001, format="%.5f", key=f"dia_{batch_num}_{row}_{col}")
-                            solid = st.number_input("Solid %", 0.0, 100.0, g_solid, 
-                                                 step=0.00001, format="%.5f", key=f"sol_{batch_num}_{row}_{col}")
-                            active_pct = st.number_input("Active %", 0.0, 100.0, g_active_pct, 
-                                                       step=0.00001, format="%.5f", key=f"actp_{batch_num}_{row}_{col}")
-                            blade = st.number_input("Blade (µm)", 1, 1000, g_blade, step=1, key=f"bl_{batch_num}_{row}_{col}")
-                        else:
-                            active, substrate, diameter, solid, active_pct, blade = (
-                                g_active, g_substrate, g_diameter, g_solid, g_active_pct, g_blade
-                            )
-                        
-                        # Measured mass with 5 decimal precision
-                        mass = st.number_input("Measured Mass (g)", 0.0, 10.0, 0.02000, 
-                                             step=0.00001, format="%.5f", key=f"m_{batch_num}_{row}_{col}")
-                        
-                        # Calculate ML with high precision
-                        total_ml, active_ml = calc_mass_loading_total_and_active(
-                            mass, diameter, substrate, active_pct
+                if not use_global_batch:
+                    with cols_layout[col + 1]:
+                        active = st.text_input("Active Material", g_active, key=f"act_{batch_num}_{row}_{col}")
+                        substrate = st.text_input("Substrate", g_substrate, key=f"sub_{batch_num}_{row}_{col}")
+                        diameter = st.number_input(
+                            "Diameter (mm)", 0.1, 100.0, g_diameter, step=0.00001, format="%.5f",
+                            key=f"dia_{batch_num}_{row}_{col}"
                         )
-                        
-                        matrix[(row, col)] = {
-                            'active': active,
-                            'substrate': substrate,
-                            'diameter': diameter,
-                            'solid': solid,
-                            'active_pct': active_pct,
-                            'blade': blade,
-                            'mass': mass,
-                            'total_ml': total_ml,
-                            'active_ml': active_ml
-                        }
-        
-        if batch_mode:
-            batches.append(matrix.copy())
-    
-    # Visualization and Analysis
-    if st.button("Generate Analysis"):
-        if batch_mode:
-            for i, batch_matrix in enumerate(batches):
-                analyze_coating(batch_matrix, n_rows, n_cols, sensitivity, batch_num=i+1)
-        else:
-            analyze_coating(matrix, n_rows, n_cols, sensitivity)
+                        solid = st.number_input(
+                            "Solid (%)", 0.0, 100.0, g_solid, step=0.00001, format="%.5f",
+                            key=f"sol_{batch_num}_{row}_{col}"
+                        )
+                        active_pct = st.number_input(
+                            "Active Material (%)", 0.0, 100.0, g_active_pct, step=0.00001,
+                            format="%.5f", key=f"actp_{batch_num}_{row}_{col}"
+                        )
+                        blade = st.number_input(
+                            "Blade Height (µm)", 1, 1000, g_blade, step=1, key=f"bl_{batch_num}_{row}_{col}"
+                        )
+                else:
+                    active, substrate, diameter, solid, active_pct, blade = g_active, g_substrate, g_diameter, g_solid, g_active_pct, g_blade
 
-def analyze_coating(matrix, n_rows, n_cols, sensitivity, batch_num=None):
-    """Helper function to analyze and visualize coating data"""
-    if not any(v['mass'] > 0 for v in matrix.values()):
-        st.error("Enter measured masses for at least some positions")
-        return
-    
-    # Prepare data for heatmap
-    ml_values = np.zeros((n_rows, n_cols))
-    for (row, col), data in matrix.items():
-        ml_values[row, col] = data['active_ml'] if not np.isnan(data['active_ml']) else 0
-    
-    # Calculate relative deviations
-    mean_ml = np.nanmean(ml_values[ml_values > 0])
-    deviations = ((ml_values - mean_ml) / mean_ml) * 100
-    abs_max_dev = np.nanmax(np.abs(deviations))
-    vmax = max(abs_max_dev, sensitivity)
-    
-    # Create interactive Plotly heatmap
-    st.subheader(f"Interactive Heatmap {'- Batch ' + str(batch_num) if batch_num else ''}")
-    plotly_fig = px.imshow(deviations, 
-                          color_continuous_scale='RdBu',
-                          zmin=-vmax, zmax=vmax,
-                          labels=dict(x="Columns", y="Rows", color="Deviation (%)"),
-                          x=[f"Col {i+1}" for i in range(n_cols)],
-                          y=[f"Row {i+1}" for i in range(n_rows)])
-    plotly_fig.update_traces(text=np.round(deviations,5), texttemplate="%{text:.5f}%")
-    plotly_fig.update_layout(title=f"Active ML Deviation (Mean: {mean_ml:.5f} mg/cm²)")
-    st.plotly_chart(plotly_fig, use_container_width=True)
-    
-    # 3D Surface Visualization
-    with st.expander("3D Surface View"):
-        from mpl_toolkits.mplot3d import Axes3D
-        fig_3d = plt.figure(figsize=(10,6))
-        ax = fig_3d.add_subplot(111, projection='3d')
-        X, Y = np.meshgrid(range(n_cols), range(n_rows))
-        ax.plot_surface(X, Y, ml_values, cmap='viridis', edgecolor='k')
-        ax.set_title("Mass Loading Topography")
-        ax.set_xlabel("Columns")
-        ax.set_ylabel("Rows")
-        ax.set_zlabel("Active ML (mg/cm²)")
-        st.pyplot(fig_3d)
-    
-    # Uniformity Metrics
-    st.subheader("Uniformity Analysis")
-    valid_ml = [v['active_ml'] for v in matrix.values() if not np.isnan(v['active_ml'])]
-    if valid_ml:
-        uniformity_score = 100 * (1 - (np.std(valid_ml)/np.mean(valid_ml)))
-        st.metric("Uniformity Score", f"{uniformity_score:.2f}%", 
-                 help="Percentage indicating coating uniformity (100% = perfect)")
-        
-        st.write("**Statistical Summary**")
-        st.markdown(f"""
-        - Mean: {np.mean(valid_ml):.5f} mg/cm²
-        - Std Dev: {np.std(valid_ml):.5f} mg/cm²
-        - Range: {np.min(valid_ml):.5f}-{np.max(valid_ml):.5f} mg/cm²
-        - Max Deviation: {np.max(np.abs(deviations)):.5f}%
-        """)
-    
-    # Export Options
-    st.subheader("Export Options")
-    export_cols = st.columns(3)
-    
-    with export_cols[0]:  # PNG Export
-        if st.button("Save Heatmap as PNG"):
-            fig, ax = plt.subplots(figsize=(max(6, n_cols*2), max(4, n_rows*1.5)))
-            im = ax.imshow(deviations, cmap='coolwarm', vmin=-vmax, vmax=vmax)
-            for (row, col), data in matrix.items():
-                if data['mass'] > 0:
-                    text = f"{data['active_ml']:.5f}\n({deviations[row, col]:+.5f}%)"
-                    color = 'black' if abs(deviations[row, col]) < vmax/2 else 'white'
-                    ax.text(col, row, text, ha='center', va='center', color=color, fontsize=9)
-            plt.colorbar(im, ax=ax, label='Deviation from Mean (%)')
-            buf = io.BytesIO()
-            fig.savefig(buf, format='png', dpi=300, bbox_inches='tight')
-            st.download_button(
-                "Download PNG",
-                data=buf.getvalue(),
-                file_name=f"coating_uniformity{'batch'+str(batch_num) if batch_num else ''}.png",
-                mime="image/png"
-            )
-    
-    with export_cols[1]:  # Excel Export
-        df_data = []
-        for (row, col), data in matrix.items():
-            df_data.append({
-                'Row': row+1,
-                'Column': col+1,
-                'Active Material': data['active'],
-                'Substrate': data['substrate'],
-                'Diameter (mm)': f"{data['diameter']:.5f}",
-                'Solid %': f"{data['solid']:.5f}",
-                'Active %': f"{data['active_pct']:.5f}",
-                'Blade Height (µm)': data['blade'],
-                'Mass (g)': f"{data['mass']:.5f}",
-                'Total ML (mg/cm²)': f"{data['total_ml']:.5f}",
-                'Active ML (mg/cm²)': f"{data['active_ml']:.5f}",
-                'Deviation (%)': f"{deviations[row, col]:.5f}" if data['mass'] > 0 else "N/A"
-            })
-        
-        excel_bytes, fname = bytes_excel(pd.DataFrame(df_data), 
-                                       f"coating_calibration{'batch'+str(batch_num) if batch_num else ''}.xlsx")
-        st.download_button(
-            "Download Excel",
-            data=excel_bytes,
-            file_name=fname,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    
-    with export_cols[2]:  # PDF Report
-            if st.button("Generate PDF Report"):
-                # Create PDF in memory
-                pdf = FPDF()
-                pdf.add_page()
-                pdf.set_font("Arial", size=12)
-                
-                # Create figures in memory
-                fig, ax = plt.subplots(figsize=(8,6))
-                im = ax.imshow(deviations, cmap='coolwarm', vmin=-vmax, vmax=vmax)
-                plt.colorbar(im, ax=ax)
-                fig.savefig("heatmap_temp.png", dpi=150, bbox_inches='tight')
-                plt.close(fig)
-                
-                fig_3d = plt.figure(figsize=(8,6))
-                ax = fig_3d.add_subplot(111, projection='3d')
-                X, Y = np.meshgrid(range(n_cols), range(n_rows))
-                ax.plot_surface(X, Y, ml_values, cmap='viridis')
-                fig_3d.savefig("3d_temp.png", dpi=150, bbox_inches='tight')
-                plt.close(fig_3d)
-                
-                # Build report
-                pdf.cell(200, 10, txt="Coating Uniformity Report", ln=1, align='C')
-                if batch_num:
-                    pdf.cell(200, 10, txt=f"Batch {batch_num}", ln=1, align='C')
-                
-                pdf.cell(200, 10, txt=f"Mean Mass Loading: {np.mean(valid_ml):.5f} mg/cm²", ln=1)
-                pdf.cell(200, 10, txt=f"Uniformity Score: {uniformity_score:.2f}%", ln=1)
-                
-                pdf.cell(200, 10, txt="2D Heatmap:", ln=1)
-                pdf.image("heatmap_temp.png", w=180)
-                
-                pdf.cell(200, 10, txt="3D Surface View:", ln=1)
-                pdf.image("3d_temp.png", w=180)
-                
-                # Save PDF to bytes
-                pdf_bytes = pdf.output(dest='S').encode('latin-1')
-                
-                # Create download button
-                st.download_button(
-                    label="Download PDF Report",
-                    data=pdf_bytes,
-                    file_name=f"coating_report{'batch'+str(batch_num) if batch_num else ''}.pdf",
-                    mime="application/pdf"
+                with cols_layout[col + 1]:
+                    mass = st.number_input(
+                        "Measured Mass (g)", 0.0, 10.0, 0.02000, step=0.00001, format="%.5f",
+                        key=f"m_{batch_num}_{row}_{col}"
+                    )
+                    total_ml, active_ml = calc_mass_loading_total_and_active(mass, diameter, substrate, active_pct)
+
+                    data_flag = ""
+                    if mass <= 0:
+                        data_flag = "MISSING MASS"
+
+                    matrix[(row, col)] = {
+                        'active': active,
+                        'substrate': substrate,
+                        'diameter': diameter,
+                        'solid': solid,
+                        'active_pct': active_pct,
+                        'blade': blade,
+                        'mass': mass,
+                        'total_ml': total_ml,
+                        'active_ml': active_ml,
+                        'flag': data_flag
+                    }
+        batches.append(matrix)
+
+    if st.button("Generate Analysis"):
+        combined_writer = BytesIO()
+        with pd.ExcelWriter(combined_writer, engine='openpyxl') as writer:
+            for i, matrix in enumerate(batches):
+                ml_values = np.zeros((n_rows, n_cols))
+                for (row, col), data in matrix.items():
+                    ml_values[row, col] = data['active_ml'] if not np.isnan(data['active_ml']) else 0
+
+                mean_ml = np.nanmean(ml_values[ml_values > 0])
+                deviations = ((ml_values - mean_ml) / mean_ml) * 100
+
+                row_labels = [f"Row {r+1}" for r in range(n_rows)]
+                col_labels = [f"Col {c+1}" for c in range(n_cols)]
+
+                # Auto-flagging based on selected heatmap mode
+                for (r, c), data in matrix.items():
+                    if heatmap_mode == "Critical Deviation" and abs(deviations[r, c]) > crit_value:
+                        data['flag'] = data['flag'] + "; CRITICAL DEV" if data['flag'] else "CRITICAL DEV"
+                    elif heatmap_mode == "Spec/Out-of-Spec" and (data['active_ml'] < spec_min or data['active_ml'] > spec_max):
+                        data['flag'] = data['flag'] + "; OUT OF SPEC" if data['flag'] else "OUT OF SPEC"
+
+                st.subheader(f"Batch {i+1} Heatmap")
+
+                # Heatmap plotting
+                if heatmap_mode == "Deviation":
+                    fig_heat = go.Figure(data=go.Heatmap(
+                        z=deviations, x=col_labels, y=row_labels,
+                        text=np.round(deviations, 2),
+                        hovertemplate="Row: %{y}<br>Col: %{x}<br>Deviation: %{text} %<extra></extra>",
+                        colorscale='RdBu', zmid=0  # blue-red for deviation
+                    ))
+                    st.plotly_chart(fig_heat)
+
+                elif heatmap_mode == "Critical Deviation":
+                    crit_map = np.full_like(ml_values, np.nan)
+                    for r in range(n_rows):
+                        for c in range(n_cols):
+                            if abs(deviations[r, c]) > crit_value:
+                                crit_map[r, c] = deviations[r, c]
+                    fig_crit = go.Figure(data=go.Heatmap(
+                        z=crit_map, x=col_labels, y=row_labels,
+                        text=np.round(crit_map, 2),
+                        hovertemplate="Row: %{y}<br>Col: %{x}<br>Deviation: %{text} %<extra></extra>",
+                        colorscale='Oranges',  # orange scale for critical deviations
+                        showscale=True
+                    ))
+                    st.plotly_chart(fig_crit)
+
+                else:  # Spec/Out-of-Spec
+                    spec_map = np.full_like(ml_values, np.nan)
+                    for r in range(n_rows):
+                        for c in range(n_cols):
+                            if ml_values[r, c] < spec_min or ml_values[r, c] > spec_max:
+                                spec_map[r, c] = ml_values[r, c]
+                    fig_spec = go.Figure(data=go.Heatmap(
+                        z=spec_map, x=col_labels, y=row_labels,
+                        text=np.round(spec_map, 2),
+                        hovertemplate="Row: %{y}<br>Col: %{x}<br>Active ML: %{text} mg/cm²<extra></extra>",
+                        colorscale='RdYlGn_r',  # red-green reversed for out-of-spec emphasis
+                        showscale=True
+                    ))
+                    st.plotly_chart(fig_spec)
+
+                # 3D Surface plot
+                mean_ml = np.nanmean(ml_values[ml_values > 0])  # calculate mean excluding zeros/nans
+                mean_plane = np.full_like(ml_values, mean_ml)
+
+                fig_3d = go.Figure()
+
+                # Surface of actual measurements
+                fig_3d.add_trace(go.Surface(
+                    z=ml_values,
+                    x=np.arange(1, n_cols+1),
+                    y=np.arange(1, n_rows+1),
+                    colorscale='Viridis',
+                    name='Measured ML',
+                    showscale=True
+                ))
+
+                # Mean plane
+                fig_3d.add_trace(go.Surface(
+                    z=mean_plane,
+                    x=np.arange(1, n_cols+1),
+                    y=np.arange(1, n_rows+1),
+                    surfacecolor=np.full_like(mean_plane, mean_ml),
+                    colorscale=[[0, 'grey'], [1, 'grey']],  # fixed color
+                    showscale=False,
+                    opacity=0.4,
+                    name='Mean ML'
+                ))
+
+                # Adjust layout to compress Y-axis and make Z less exaggerated
+                fig_3d.update_layout(
+                    scene=dict(
+                        xaxis_title="Columns",
+                        yaxis_title="Rows",
+                        zaxis_title="Active ML (mg/cm²)",
+                        aspectratio=dict(x=1, y=1, z=0.3),  # x, y, and z aspect ratios
+                        camera=dict(eye=dict(x=1.5, y=1.5, z=0.8))  # optional nicer angle
+                    ),
+                    legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
                 )
-                
-                # Clean up temp files
-                import os
-                if os.path.exists("heatmap_temp.png"):
-                    os.remove("heatmap_temp.png")
-                if os.path.exists("3d_temp.png"):
-                    os.remove("3d_temp.png")
+
+                st.plotly_chart(fig_3d)
+
+                # Uniformity and stats
+                valid_ml = [v['active_ml'] for v in matrix.values() if not np.isnan(v['active_ml'])]
+                if valid_ml:
+                    uniformity_score = 100*(1 - (np.std(valid_ml)/np.mean(valid_ml)))
+                    st.metric("Uniformity Score", f"{uniformity_score:.2f}%")
+                    st.write("**Statistical Summary**")
+                    st.markdown(f"""
+                    - Mean: {np.mean(valid_ml):.5f} mg/cm²
+                    - Std Dev: {np.std(valid_ml):.5f} mg/cm²
+                    - Range: {np.min(valid_ml):.5f} - {np.max(valid_ml):.5f} mg/cm²
+                    - Max Deviation: {np.max(np.abs(deviations)):.5f}%
+                    """)
+
+                # Excel export
+                df_data = []
+                for (row, col), data in matrix.items():
+                    df_data.append({
+                        'Row': row+1,
+                        'Column': col+1,
+                        'Active Material': data['active'],
+                        'Substrate': data['substrate'],
+                        'Diameter (mm)': f"{data['diameter']:.5f}",
+                        'Solid (%)': f"{data['solid']:.5f}",
+                        'Active Material (%)': f"{data['active_pct']:.5f}",
+                        'Blade Height (µm)': data['blade'],
+                        'Mass (g)': f"{data['mass']:.5f}",
+                        'Total ML (mg/cm²)': f"{data['total_ml']:.5f}",
+                        'Active ML (mg/cm²)': f"{data['active_ml']:.5f}",
+                        'Deviation (%)': f"{deviations[row,col]:.2f}",
+                        'Flag': data['flag']
+                    })
+
+                df = pd.DataFrame(df_data)
+
+                # Add stats as separate rows at the bottom
+                stats_rows = pd.DataFrame([{
+                    'Row': 'STAT',
+                    'Column': '',
+                    'Active Material': '',
+                    'Substrate': '',
+                    'Diameter (mm)': '',
+                    'Solid (%)': '',
+                    'Active Material (%)': '',
+                    'Blade Height (µm)': '',
+                    'Mass (g)': '',
+                    'Total ML (mg/cm²)': '',
+                    'Active ML (mg/cm²)': f"{np.mean(valid_ml):.5f}",
+                    'Deviation (%)': f"Std: {np.std(valid_ml):.5f}, Range: {np.min(valid_ml):.5f}-{np.max(valid_ml):.5f}, Max Dev: {np.max(np.abs(deviations)):.5f}%, Uniformity: {uniformity_score:.2f}%",
+                    'Flag': ''
+                }])
+                df = pd.concat([df, stats_rows], ignore_index=True)
+
+                df.to_excel(writer, sheet_name=f"Batch_{i+1}", index=False)
+
+                st.download_button(
+                    "Download All Batches Excel",
+                    data=combined_writer.getvalue(),
+                    file_name="coating_calibration_report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
+
 
 # =========================
 # Electrode Database Manager
