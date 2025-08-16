@@ -6,3 +6,4 @@ scipy
 xlsxwriter
 fpdf2
 plotly
+openpyxl
