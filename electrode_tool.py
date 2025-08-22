@@ -2131,6 +2131,7 @@ def electrode_database_manager():
             else:
                 substrate_mass_g = get_substrate_mass_g(substrate_name, diameter)
                 if substrate_name in SUBSTRATE_LIBRARY:
+                    area_cm2 = mm_diameter_to_area_cm2(diameter)
                     tare_val = SUBSTRATE_LIBRARY[substrate_name]["tare_mg_cm2"]
                     substrate_display = f"{substrate_name} ({tare_val:.3f} mg/cm²)"
                     tare_mg_cm2 = tare_val
