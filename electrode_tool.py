@@ -1,32 +1,34 @@
-# Battery Lab Tools — Slurry + Blade Height + Capacity Match + Electrode Database
+# Battery Lab Tools
 
 # =========================
 # Requirements Config
 # =========================
 
-import io
-import os
-import math
-import json
+import os, io, math, json, datetime
+
 import numpy as np
 import pandas as pd
-import streamlit as st
+
 import matplotlib.pyplot as plt
-import scipy
-from scipy.stats import linregress
-import xlsxwriter
-from fpdf import FPDF
-import mpl_toolkits
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from mpl_toolkits.mplot3d import Axes3D
+
+import seaborn as sns
 import plotly.express as px
 import plotly.graph_objects as go
-from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+
+import streamlit as st
+from scipy.stats import linregress, t
+
 from io import BytesIO
+import xlsxwriter
+from fpdf import FPDF
+
 
 # =========================
 # Global Config
 # =========================
-st.set_page_config(page_title="Battery Lab Tools", layout="wide")
+st.set_page_config(page_title="Slurry Calculator", layout="wide")
 plt.rcParams.update({"figure.max_open_warning": 0})
 
 # =========================
@@ -35,7 +37,7 @@ plt.rcParams.update({"figure.max_open_warning": 0})
 ELECTRODE_AREA_13MM = 1.3273  # cm², 13 mm punch (π * (6.5 mm)^2 / 100)
 DEFAULT_DB_FILE = "electrode_database.xlsx"
 
-# Foil masses for 13 mm punches measured in the user's earlier data
+# Foil masses for 13 mm punches measured in earlier data
 AL_FOIL_MASS_13MM = 0.005525  # g
 CU_FOIL_MASS_13MM = 0.011644  # g
 HC_FOIL_MASS_13MM = 0.005933 # g
@@ -111,7 +113,8 @@ CATHODE_DATA = {
         20: np.array([0.0118, 0.0111, 0.0110, 0.0111, 0.0115, 0.0118, 0.0119, 0.0119, 0.0119]),
         25: np.array([0.0140, 0.0137, 0.0134, 0.0132, 0.0130, 0.0130, 0.0138, 0.0137, 0.0138]),
         30: np.array([0.0163, 0.0159, 0.0157, 0.0161, 0.0155, 0.0152, 0.0162, 0.0160, 0.0160])
-    }
+    },
+    # Add more cathodes if available
 }
 
 ANODE_DATA = {
@@ -124,7 +127,7 @@ ANODE_DATA = {
     # Add more anodes if available (e.g., Hard Carbon)
 }
 
-# Default active material fractions for capacity match
+# Default active material fractions for capacity match based on historical data
 MATERIAL_ACTIVE_RATIOS = {
     'NaVP': 0.96,
     'LVP': 0.96,
@@ -134,6 +137,22 @@ MATERIAL_ACTIVE_RATIOS = {
     'Hard Carbon': 0.90,
 }
 
+MATERIAL_LIBRARY = {
+    "NaVP": {"type": "Cathode", "active_pct": 96.0, "capacity": 110},
+    "LVP": {"type": "Cathode", "active_pct": 96.0, "capacity": 120},
+    "Li3V2(PO4)3": {"type": "Cathode", "active_pct": 96.0, "capacity": 120},
+    "Na3V2(PO4)3": {"type": "Cathode", "active_pct": 96.0, "capacity": 110},
+    "Graphite": {"type": "Anode", "active_pct": 80.0, "capacity": 350},
+    "Hard Carbon": {"type": "Anode", "active_pct": 90.0, "capacity": 300},
+}
+
+SUBSTRATE_LIBRARY = {
+    "Aluminum Foil": {"tare_mg_cm2": 4.163, "mass_13mm": AL_FOIL_MASS_13MM, "type": "Cathode"},
+    "Copper Foil": {"tare_mg_cm2": 8.775, "mass_13mm": CU_FOIL_MASS_13MM, "type": "Anode"},
+    "Carbon-Coated Al": {"tare_mg_cm2": 4.473, "mass_13mm": HC_FOIL_MASS_13MM, "type": "Cathode"},
+}
+
+
 # =========================
 # Utilities
 # =========================
@@ -141,32 +160,65 @@ def mm_diameter_to_area_cm2(d_mm: float) -> float:
     r_cm = (d_mm / 2.0) / 10.0
     return math.pi * r_cm * r_cm
 
-def pick_foil_mass(sub: str) -> float | None:
-    if not sub:
+def pick_foil_mass(substrate_str: str) -> float | None:
+    """Improved substrate mass lookup with fuzzy matching"""
+    if not substrate_str:
         return None
-    key = sub.strip().lower()
-    return FOIL_MASS_MAP.get(key, None)
+    
+    substrate_lower = str(substrate_str).strip().lower()
+    
+    # Exact match first
+    for key, mass in FOIL_MASS_MAP.items():
+        if substrate_lower == key:
+            return mass
+    
+    # Fuzzy matching for common variations
+    if any(word in substrate_lower for word in ["aluminum", "aluminium", "al"]):
+        if any(word in substrate_lower for word in ["carbon", "coated"]):
+            return HC_FOIL_MASS_13MM
+        else:
+            return AL_FOIL_MASS_13MM
+    elif any(word in substrate_lower for word in ["copper", "cu"]):
+        return CU_FOIL_MASS_13MM
+    
+    # Try to extract tare value from substrate name if it contains numbers
+    import re
+    numbers = re.findall(r'\d+\.?\d*', substrate_lower)
+    if numbers:
+        try:
+            # If substrate name contains a number, assume it's mg/cm²
+            tare_mg_cm2 = float(numbers[0])
+            area_13mm = mm_diameter_to_area_cm2(13.0)
+            return (tare_mg_cm2 / 1000.0) * area_13mm
+        except:
+            pass
+    
+    return None
 
 def calc_mass_loading_total_and_active(
     disk_mass_g: float,
     diameter_mm: float,
-    substrate: str,
+    substrate_mass_g: float,
     active_pct: float | None,
 ) -> tuple[float, float]:
     """
+    Args:
+      disk_mass_g: total electrode mass in grams (disk+substrate)
+      diameter_mm: electrode diameter in mm
+      substrate_mass_g: substrate tare mass in grams (calculated from mg/cm² input)
+      active_pct: % of active material in the coating
+
     Returns:
       total_ml_mg_cm2: mg/cm² of total coating (foil-subtracted)
       active_ml_mg_cm2: mg/cm² of active-only (if active_pct provided)
     """
     area = mm_diameter_to_area_cm2(diameter_mm)
-    foil = pick_foil_mass(substrate)
     if area <= 0 or disk_mass_g is None or np.isnan(disk_mass_g):
         return (np.nan, np.nan)
-    if foil is None:
-        # Cannot subtract foil. Treat disk mass as coating mass. Warn upstream in UI.
-        coat_mass_g = disk_mass_g
-    else:
-        coat_mass_g = max(disk_mass_g - foil, 0.0)
+
+    # Subtract the foil tare directly
+    coat_mass_g = max(disk_mass_g - substrate_mass_g, 0.0)
+
     total_ml = (coat_mass_g * 1000.0) / area
     active_ml = total_ml * (active_pct / 100.0) if active_pct is not None else np.nan
     return (total_ml, active_ml)
@@ -179,14 +231,23 @@ def bytes_excel(df: pd.DataFrame, filename="export.xlsx") -> tuple[bytes, str]:
     return buf.read(), filename
 
 def ensure_db_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure database has all required columns with proper names"""
     cols = [
         "Active Material", "Substrate", "Diameter (mm)", "Mass (g)",
         "Solid %", "Blade Height (µm)", "Active Material %",
-        "Mass Loading (mg/cm²)", "Active ML (mg/cm²)"
+        "Mass Loading (mg/cm²)", "Active ML (mg/cm²)", 
+        "Date Made", "Made By", "Notes"
     ]
     for c in cols:
         if c not in df.columns:
-            df[c] = np.nan
+            if c == "Date Made":
+                df[c] = ""
+            elif c == "Made By":
+                df[c] = ""
+            elif c == "Notes":
+                df[c] = ""
+            else:
+                df[c] = np.nan
     return df[cols]
 
 def load_database(file_path: str) -> pd.DataFrame:
@@ -204,31 +265,116 @@ def save_database(df: pd.DataFrame, file_path: str):
     df = ensure_db_columns(df)
     df.to_excel(file_path, index=False)
 
-def plot_regression(
-    x_vals, y_vals, xlabel, ylabel, material_label=None, color="blue",
-    target_y=None, recommended_x=None, x_is_ticks=True
-):
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.scatter(x_vals, y_vals, color=color, label="Measured")
-    slope, intercept, r, p, se = linregress(x_vals, y_vals)
-    fit_x = np.linspace(min(x_vals)*0.8, max(x_vals)*1.2, 200)
-    fit_y = slope * fit_x + intercept
-    ax.plot(fit_x, fit_y, linestyle='--', color=color, label=f"Fit: y={slope:.3f}x+{intercept:.3f} (R²={r**2:.3f})")
-    if target_y is not None:
-        ax.axhline(target_y, linestyle=':', color='black', label=f"Target {ylabel}")
+def mass_to_mg_per_cm2(mass_g, punch_diameter_mm=13):
+    radius_cm = (punch_diameter_mm / 10) / 2
+    area_cm2 = math.pi * radius_cm**2
+    return round((mass_g / area_cm2) * 1000, 3)
+
+substrates_dropdown = [
+    (f"Aluminum Foil ({mass_to_mg_per_cm2(AL_FOIL_MASS_13MM)} mg/cm² tare)", AL_FOIL_MASS_13MM),
+    (f"Copper Foil ({mass_to_mg_per_cm2(CU_FOIL_MASS_13MM)} mg/cm² tare)", CU_FOIL_MASS_13MM),
+    (f"High Carbon Aluminum Foil ({mass_to_mg_per_cm2(HC_FOIL_MASS_13MM)} mg/cm² tare)", HC_FOIL_MASS_13MM)
+]
+
+def get_substrate_mass_g(substrate_str: str, diameter_mm: float) -> float:
+    """Get substrate mass in grams for given diameter"""
+    # First try the pick_foil_mass function (for 13mm)
+    mass_13mm = pick_foil_mass(substrate_str)
+    if mass_13mm is not None:
+        # Scale to actual diameter
+        area_13mm = mm_diameter_to_area_cm2(13.0)
+        area_actual = mm_diameter_to_area_cm2(diameter_mm)
+        return mass_13mm * (area_actual / area_13mm)
+    
+    # Default fallback
+    area_actual = mm_diameter_to_area_cm2(diameter_mm)
+    return (4.0 / 1000.0) * area_actual  # 4 mg/cm² default
+
+def plot_regression(x, y, xlabel="", ylabel="", material_label="", color='black',
+                    target_y=None, recommended_x=None, x_is_ticks=False, alpha_ci=0.05):
+    """
+    Plots linear regression with:
+      - regression line spanning the full relevant x range
+      - confidence interval for the mean 
+      - prediction interval for new observations
+      - optional horizontal/vertical target lines
+      - automatic dynamic scaling to include targets or recommended values
+      - origin (0,0) always in view
+    """
+    x = np.array(x)
+    y = np.array(y)
+    n = len(x)
+
+    # Fit regression
+    slope, intercept, r_value, p_value, std_err = linregress(x, y)
+    y_pred = slope * x + intercept
+
+    # Determine dynamic x-axis range: cover data + recommended_x if given
+    x_vals = [x.min(), x.max()]
     if recommended_x is not None:
-        ax.axvline(recommended_x, linestyle=':', color='gray',
-                   label=f"Recommended Height: {recommended_x:.1f} {'(10 μm)' if x_is_ticks else 'µm'}")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    title = f"{ylabel} vs {xlabel}"
-    if material_label:
-        title += f" — {material_label}"
-    ax.set_title(title)
-    ax.grid(True)
-    ax.legend()
-    st.pyplot(fig)
-    return slope, intercept, r**2
+        x_vals.append(recommended_x)
+    x_min, x_max = min(x_vals), max(x_vals)
+    
+    # Ensure origin (0,0) is always in view
+    x_min = min(0, x_min) if x_min > 0 else x_min
+    x_range = x_max - x_min
+    x_plot = np.linspace(x_min - 0.1*x_range, x_max + 0.1*x_range, 500)
+    y_plot = slope * x_plot + intercept
+
+    # Standard error of estimate
+    residuals = y - y_pred
+    se = np.sqrt(np.sum(residuals**2) / (n - 2))
+    x_mean = np.mean(x)
+    ssx = np.sum((x - x_mean)**2)
+
+    # Confidence interval for mean prediction
+    se_fit = se * np.sqrt(1/n + (x_plot - x_mean)**2 / ssx)
+    t_val = t.ppf(1 - alpha_ci/2, df=n-2)
+    ci_upper = y_plot + t_val * se_fit
+    ci_lower = y_plot - t_val * se_fit
+
+    # Prediction interval for new observation
+    se_pred = se * np.sqrt(1 + 1/n + (x_plot - x_mean)**2 / ssx)
+    pi_upper = y_plot + t_val * se_pred
+    pi_lower = y_plot - t_val * se_pred
+
+    # Determine dynamic y-axis range: cover data + CI/PI + target_y if given
+    y_vals = [y.min(), y.max(), ci_lower.min(), ci_upper.max(), pi_lower.min(), pi_upper.max()]
+    if target_y is not None:
+        y_vals.append(target_y)
+    y_min, y_max = min(y_vals), max(y_vals)
+    
+    # Ensure origin (0,0) is always in view
+    y_min = min(0, y_min) if y_min > 0 else y_min
+    y_range = y_max - y_min
+    y_min -= 0.05 * y_range
+    y_max += 0.05 * y_range
+
+    # Plotting
+    plt.figure(figsize=(8,5))
+    plt.scatter(x, y, color=color, label=f"Data: {material_label}")
+    plt.plot(x_plot, y_plot, color='red', label=f"Linear Fit (R²={r_value**2:.3f})")
+    plt.fill_between(x_plot, ci_lower, ci_upper, color='red', alpha=0.2, label=f'{int((1-alpha_ci)*100)}% CI')
+    plt.fill_between(x_plot, pi_lower, pi_upper, color='orange', alpha=0.2, label=f'{int((1-alpha_ci)*100)}% PI')
+
+    # Target lines
+    if target_y is not None:
+        plt.axhline(target_y, color='green', linestyle='--', label=f"Target ML = {target_y:.2f}")
+    if recommended_x is not None:
+        plt.axvline(recommended_x, color='blue', linestyle='--', label=f"Recommended X = {recommended_x:.2f}")
+
+    plt.xlim(x_min, x_max + 0.05*x_range)
+    plt.ylim(y_min, y_max)
+
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(f"{ylabel} vs {xlabel}" + (f" — {material_label}" if material_label else ""))
+    plt.grid(True)
+    plt.legend()
+    st.pyplot(plt.gcf())
+
+    return slope, intercept, r_value**2
+
 
 # =========================
 # Sidebar: DB file selection
@@ -245,7 +391,7 @@ if st.sidebar.button("Create empty DB if missing"):
 # =========================
 tool = st.sidebar.radio(
     "Select Tool",
-    options=["Slurry Calculator", "Blade Height Recommender", "Capacity Match Tool", "Coating Calibration Tool", "Electrode Database Manager"],
+    options=["Slurry Calculator", "Blade Height Recommender", "Capacity Match Tool", "Coating Calibration Tool", "Electrode Database Manager"],     format_func=lambda x: x,
     index=0
 )
 
@@ -254,42 +400,52 @@ tool = st.sidebar.radio(
 # =========================
 
 def slurry_calculator():
-    st.title("Slurry Calculator")
-    st.caption("Cathode/Anode slurry planning with true recipe tracking, multi-component breakdown, and dilution history.")
 
-    # ---- Column 1: Formula & Mass Targets ----
-    col1, col2 = st.columns(2, gap="large")
-    with col1:
-        st.subheader("Formula (must sum to 100%)")
-        active_ratio = st.number_input("Active Material % in Formula", 0.0, 100.0, 96.0, 0.1)
-        carbon_ratio = st.number_input("Conductive Carbon % in Formula", 0.0, 100.0, 2.0, 0.1)
-        binder_ratio = st.number_input("Binder % in Formula", 0.0, 100.0, 2.0, 0.1)
+    # Initialize session_state variables
+    if "recipe" not in st.session_state:
+        st.session_state.recipe = {}
+    if "dilutions" not in st.session_state:
+        st.session_state.dilutions = []
+
+    st.title("Slurry Calculator")
+    st.caption("Plan your cathode/anode slurry with multi-component tracking and dilution history.")
+
+    # ===== Formula & Mass Targets =====
+    with st.expander("1️⃣ Formula & Mass Targets", expanded=True):
+        st.subheader("Mass Ratios (%)")
+        active_ratio = st.number_input("Active Material %", 0.0, 100.0, 96.0, 0.1)
+        carbon_ratio = st.number_input("Conductive Carbon %", 0.0, 100.0, 2.0, 0.1)
+        binder_ratio = st.number_input("Binder %", 0.0, 100.0, 2.0, 0.1)
+
         total_ratio = active_ratio + carbon_ratio + binder_ratio
         if abs(total_ratio - 100.0) > 0.01:
-            st.error(f"Mass ratio must add to 100%. Current: {total_ratio:.2f}%")
+            st.error(f"Mass ratio must sum to 100%. Current: {total_ratio:.2f}%")
             st.stop()
 
         target_mode = st.radio("Target Mode", ["Active Mass (g)", "Total Slurry Mass (g)"])
         if target_mode == "Active Mass (g)":
-            active_mass = st.number_input("Active Material Mass (g)", 0.0, step=0.01, value=1.0)
+            active_mass = st.number_input("Active Material Mass (g)", 0.0, step=0.00001, value=1.0)
         else:
-            total_slurry_mass = st.number_input("Total Slurry Mass (g)", 0.0, step=0.01, value=10.0)
+            total_slurry_mass = st.number_input("Total Slurry Mass (g)", 0.0, step=0.00001, value=10.0)
 
         use_solution = st.checkbox("Using Binder Solution?", True)
-        binder_solution_pct = None
-        if use_solution:
-            binder_solution_pct = st.number_input("Binder % in Solution", 0.1, 100.0, 5.0)
-
+        binder_solution_pct = st.number_input("Binder % in Solution", 0.1, 100.0, 5.0) if use_solution else None
         solid_pct = st.number_input("Target Solid Content (%)", 0.1, 100.0, 30.0)
 
-    # ---- Component breakdown function ----
+    # ===== Component Breakdown =====
     def get_components(name, default_names, default_weights):
         multi = st.checkbox(f"{name} has multiple components?", value=False, key=f"{name}_multi")
-        n = st.number_input(f"Number of {name} components", 1, 10, value=len(default_names), key=f"{name}_count") if multi else 1
+        n = st.number_input(f"Number of {name} components", 1, 10,
+                            value=len(default_names), key=f"{name}_count") if multi else 1
         names, weights = [], []
         for i in range(n):
-            nm = st.text_input(f"{name} #{i+1} name", value=default_names[i] if i < len(default_names) else "", key=f"{name}_{i}_nm")
-            wt = st.number_input(f"{name} #{i+1} %", 0.0, 100.0, value=default_weights[i] if i < len(default_weights) else 100.0/n, step=0.1, key=f"{name}_{i}_wt")
+            nm = st.text_input(f"{name} #{i+1} name",
+                            value=default_names[i] if i < len(default_names) else "",
+                            key=f"{name}_{i}_nm")
+            wt = st.number_input(f"{name} #{i+1} %",
+                                0.0, 100.0,
+                                value=default_weights[i] if i < len(default_weights) else 100.0/n,
+                                step=0.1, key=f"{name}_{i}_wt")
             names.append(nm)
             weights.append(wt)
         if abs(sum(weights) - 100.0) > 0.01:
@@ -297,91 +453,93 @@ def slurry_calculator():
             return None, None
         return names, weights
 
-    with col2:
-        st.subheader("Component Details")
-        active_names, active_weights = get_components("Active", ["NVP"], [100.0])
+    with st.expander("2️⃣ Component Breakdown", expanded=False):
+        active_names, active_weights = get_components("Active", ["LVP"], [100.0])
         carbon_names, carbon_weights = get_components("Carbon", ["Super P"], [100.0])
-        binder_names, binder_weights = get_components("Binder", ["CMC"], [100.0])
+        binder_names, binder_weights = get_components("Binder", ["PVDF"], [100.0])
         solvent_names, solvent_weights = get_components("Solvent", ["NMP"], [100.0])
         if None in (active_names, carbon_names, binder_names, solvent_names):
             st.stop()
 
-    # ---- Compute masses ----
-    active_frac, carbon_frac, binder_frac = active_ratio/100, carbon_ratio/100, binder_ratio/100
-    if target_mode == "Active Mass (g)":
-        carbon_mass = (carbon_frac / active_frac) * active_mass if active_frac > 0 else 0
-        binder_mass = (binder_frac / active_frac) * active_mass if active_frac > 0 else 0
-        total_solids = active_mass + carbon_mass + binder_mass
-        total_slurry_mass = total_solids / (solid_pct / 100.0)
-    else:
-        total_solids = total_slurry_mass * (solid_pct / 100.0)
-        active_mass = (active_frac / (active_frac + carbon_frac + binder_frac)) * total_solids
-        carbon_mass = (carbon_frac / active_frac) * active_mass if active_frac > 0 else 0
-        binder_mass = total_solids - active_mass - carbon_mass
+    # ===== Slurry Recipe & Masses =====
+    with st.expander("3️⃣ Slurry Recipe & Masses", expanded=True):
+        # Calculate masses
+        active_frac, carbon_frac, binder_frac = active_ratio/100, carbon_ratio/100, binder_ratio/100
+        if target_mode == "Active Mass (g)":
+            carbon_mass = (carbon_frac / active_frac) * active_mass if active_frac > 0 else 0
+            binder_mass = (binder_frac / active_frac) * active_mass if active_frac > 0 else 0
+            total_solids = active_mass + carbon_mass + binder_mass
+            total_slurry_mass = total_solids / (solid_pct / 100.0)
+        else:
+            total_solids = total_slurry_mass * (solid_pct / 100.0)
+            active_mass = (active_frac / (active_frac + carbon_frac + binder_frac)) * total_solids
+            carbon_mass = (carbon_frac / active_frac) * active_mass if active_frac > 0 else 0
+            binder_mass = total_solids - active_mass - carbon_mass
 
-    binder_solution_mass = binder_mass / (binder_solution_pct/100.0) if use_solution else binder_mass
-    solvent_pure_mass = total_slurry_mass - total_solids - (binder_solution_mass - binder_mass if use_solution else 0)
-    solvent_in_binder = binder_solution_mass - binder_mass if use_solution else 0
-    solvent_total_combined = solvent_pure_mass + solvent_in_binder
+        binder_solution_mass = binder_mass / (binder_solution_pct/100.0) if use_solution else binder_mass
+        solvent_in_binder = binder_solution_mass - binder_mass if use_solution else 0
+        solvent_pure_mass = total_slurry_mass - total_solids - solvent_in_binder
+        solvent_total_combined = solvent_pure_mass + solvent_in_binder
 
-    # ---- Display recipe ----
-    st.subheader("Initial Slurry Recipe")
-    recipe_dict = {
-        "Active Mass (g)": active_mass,
-        "Carbon Mass (g)": carbon_mass,
-        "Binder Mass (g)": binder_mass,
-        "Binder Solution Mass (g)": binder_solution_mass if use_solution else None,
-        "Solvent Mass Total (g)": solvent_total_combined,
-        "Solvent Pure (g)": solvent_pure_mass,
-        "Solvent in Binder Solution (g)": solvent_in_binder,
-        "Total Solids (g)": total_solids,
-        "Total Slurry Mass (g)": total_slurry_mass,
-    }
-    clean_dict = {k:v for k,v in recipe_dict.items() if v is not None}
-    df_recipe = pd.DataFrame.from_dict({k: round(v,4) for k,v in clean_dict.items()}, orient="index", columns=["Mass (g)"])
-    st.table(df_recipe)
+        # Store recipe in session_state
+        st.session_state.recipe = {
+            "Active Mass (g)": active_mass,
+            "Carbon Mass (g)": carbon_mass,
+            "Binder Mass (g)": binder_mass,
+            "Binder Solution Mass (g)": binder_solution_mass if use_solution else None,
+            "Solvent Mass Total (g)": solvent_total_combined,
+            "Solvent Pure (g)": solvent_pure_mass,
+            "Solvent in Binder Solution (g)": solvent_in_binder,
+            "Total Solids (g)": total_solids,
+            "Total Slurry Mass (g)": total_slurry_mass,
+        }
 
-    st.subheader("Component Mass Breakdown")
-    def display_breakdown(names, weights, total_mass, label):
-        st.markdown(f"**{label} components:**")
-        for nm, wt in zip(names, weights):
-            st.markdown(f"- {nm}: {total_mass*wt/100:.4f} g")
-    display_breakdown(active_names, active_weights, active_mass, "Active")
-    display_breakdown(carbon_names, carbon_weights, carbon_mass, "Carbon")
-    display_breakdown(binder_names, binder_weights, binder_mass, "Binder")
-    display_breakdown(solvent_names, solvent_weights, solvent_total_combined, "Solvent (total)")
+        # Display recipe
+        df_recipe = pd.DataFrame.from_dict(
+            {k: round(v, 4) for k, v in st.session_state.recipe.items() if v is not None},
+            orient="index", columns=["Mass (g)"]
+        )
+        st.table(df_recipe)
 
-    # ---- True Recipe Tracker ----
-    track_true = st.checkbox("Track True Recipe?")
-    true_recipe = {}
-    if track_true:
-        st.subheader("Input Actual Masses")
-        for k in clean_dict.keys():
-            val = st.number_input(f"Actual {k}", value=clean_dict[k], step=0.01)
-            true_recipe[k] = val
-        st.markdown("**Actual component breakdown**")
-        display_breakdown(active_names, active_weights, true_recipe['Active Mass (g)'], "Active")
-        display_breakdown(carbon_names, carbon_weights, true_recipe['Carbon Mass (g)'], "Carbon")
-        display_breakdown(binder_names, binder_weights, true_recipe['Binder Mass (g)'], "Binder")
-        display_breakdown(solvent_names, solvent_weights, true_recipe['Solvent Mass Total (g)'], "Solvent (total)")
+    # ===== Slurry Dilution Tracker =====
+    with st.expander("4️⃣ Slurry Dilution Tracker", expanded=True):
+        recipe = st.session_state.recipe
+        total_solids = recipe["Total Solids (g)"]
+        original_mass = recipe["Total Slurry Mass (g)"]
 
-    # ---- Dilution history tracker ----
-    st.subheader("Dilution Tool")
-    if 'dilution_history' not in st.session_state:
-        st.session_state.dilution_history = []
+        # Calculate current slurry mass including any previous dilutions
+        current_mass = original_mass + sum(st.session_state.dilutions)
+        current_solid_pct = (total_solids / current_mass) * 100
+        st.info(f"Current slurry mass = {current_mass:.4f} g, Solid % = {current_solid_pct:.2f}%")
 
-    new_solid_pct = st.number_input("New Solid % (must be <= original)", 0.1, solid_pct, value=solid_pct)
+        target_solid = st.number_input("Target Solid Content (%) for Dilution", 0.1, 100.0, value=current_solid_pct, step=0.1)
 
-    if new_solid_pct < solid_pct:
-        # Calculate additional solvent needed
-        current_total_slurry = total_slurry_mass
-        new_total_slurry = total_solids / (new_solid_pct / 100.0)
-        additional_solvent = new_total_slurry - current_total_slurry
-        st.session_state.dilution_history.append(additional_solvent)
-        st.success(f"Add {additional_solvent:.4f} g of solvent to reach {new_solid_pct}% solids.")
-    st.write("Dilution history (g solvent added):", st.session_state.dilution_history)
+        if st.button("Calculate Solvent Addition"):
+            if target_solid < current_solid_pct:
+                # Calculate the amount of solvent needed
+                new_total_mass = total_solids / (target_solid / 100)
+                added_solvent = new_total_mass - current_mass
 
+                st.session_state.dilutions.append(added_solvent)
 
+                # Update current mass and solid % immediately for display
+                current_mass += added_solvent
+                current_solid_pct = (total_solids / current_mass) * 100
+
+                st.success(f"Add {added_solvent:.4f} g solvent to reach {target_solid:.2f}% solids.")
+                st.info(f"New slurry mass = {current_mass:.4f} g, Solid % = {current_solid_pct:.2f}%")
+            else:
+                st.warning("Target solid % must be lower than current solid %.")
+
+        # Display dilution history
+        if st.session_state.dilutions:
+            st.subheader("Dilution History")
+            for i, amt in enumerate(st.session_state.dilutions, 1):
+                st.write(f"Dilution {i}: {amt:.4f} g")
+            total_added = sum(st.session_state.dilutions)
+            st.markdown(f"**Total Solvent Added:** {total_added:.4f} g")
+            st.markdown(f"**New Solid Content:** {(total_solids / (original_mass + total_added))*100:.2f}%")
+            
     # ---- Export to Excel ----
     if st.button("Export Recipe to Excel"):
         buffer = io.BytesIO()
@@ -402,7 +560,6 @@ def slurry_calculator():
                 df_dilution = pd.DataFrame(dilution_data)
                 df_dilution.to_excel(writer, sheet_name="Dilution History")
 
-            # Optional: Combined visualization sheet
             # Create a sheet with total solvent, total solids, and cumulative dilution
             combined_data = {
                 "Total Solids (g)": [total_solids],
@@ -446,7 +603,7 @@ def slurry_calculator():
         
         3. Binder Solution Mass = {'Binder Mass / (Binder Solution % / 100)' if use_solution else 'N/A'}  
         = {binder_solution_mass:.4f} g
-        
+    
         4. Total Solids = Active + Carbon + Binder  
         = {active_mass:.4f} + {carbon_mass:.4f} + {binder_mass:.4f}  
         = {total_solids:.4f} g
@@ -473,115 +630,173 @@ def slurry_calculator():
 # =========================
 # Blade Height Recommender (DB-aware)
 # =========================
+
 def blade_height_recommender():
-    st.title("Blade Height Recommender")
+    st.title("📐 Blade Height Recommender")
     st.caption("Fit mass loading vs blade height from built-in data or your database.")
     db = load_database(db_file)
 
     # Data source selector
     src = st.radio("Data source", ["Use Database", "Use Built-in Dataset"], index=0, horizontal=True)
 
-    # Material selection
     if src == "Use Database":
         if db.empty:
-            st.warning("Database empty. Upload or add entries in the Electrode Database Manager.")
-            st.stop()
+            st.warning("📭 Database is empty. Add some electrodes in the Database Manager first!")
+            return
 
-        mat_side = st.selectbox("Electrode side", ["Cathode", "Anode"])
-        if mat_side == "Cathode":
-            candidates = sorted({m for m in db["Active Material"].dropna().unique() if m in CATHODE_DATA.keys() or m})
-        else:
-            candidates = sorted({m for m in db["Active Material"].dropna().unique() if m in ANODE_DATA.keys() or m})
+        st.subheader("Select Material & Filters")
+        
+        # Step 1: Material selection with preview
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            available_materials = sorted([m for m in db["Active Material"].dropna().unique() if str(m).strip()])
+            if not available_materials:
+                st.error("No materials found in database.")
+                return
+                
+            material = st.selectbox("Active Material", available_materials)
+            
+            # Show quick preview
+            material_data = db[db["Active Material"] == material]
+            st.info(f"📊 Found **{len(material_data)}** electrodes with {material}")
+        
+        with col2:
+            # Step 2: Substrate selection
+            available_substrates = sorted([s for s in material_data["Substrate"].dropna().unique() if str(s).strip()])
+            if not available_substrates:
+                st.error("No substrates found for this material.")
+                return
+                
+            substrate = st.selectbox("🏗️ Substrate", available_substrates)
+            
+            # Show substrate preview
+            substrate_data = material_data[material_data["Substrate"] == substrate]
+            st.info(f"📋 Found **{len(substrate_data)}** with this substrate")
 
-        material = st.selectbox("Material", candidates)
-        substrate = st.text_input("Filter by substrate (optional, exact match recommended)", value="")
-        d_lower, d_upper = st.columns(2)
-        with d_lower:
-            tol_active = st.number_input("Active Material % filter: min", 0.0, 100.0, value=0.0, step=0.1)
-        with d_upper:
-            tol_solid = st.number_input("Solid % filter: min", 0.0, 100.0, value=0.0, step=0.1)
+        # Step 3: Quality filters
+        st.subheader("Quality Filters")
+        col3, col4 = st.columns(2)
+        
+        with col3:
+            active_pct_min = st.slider("Minimum Active Material %", 0.0, 100.0, 90.0, 1.0)
+        with col4:
+            solid_pct_min = st.slider("Minimum Solid %", 0.0, 100.0, 20.0, 5.0)
 
-        # Compute ML for each DB row if missing
-        db = db.copy()
-        missing_ml = db["Mass Loading (mg/cm²)"].isna() | db["Active ML (mg/cm²)"].isna()
+        # Auto-calculate missing mass loadings
+        db_work = db.copy()
+        missing_ml = db_work["Mass Loading (mg/cm²)"].isna() | db_work["Active ML (mg/cm²)"].isna()
+        
         if missing_ml.any():
-            for idx in db.index[missing_ml]:
-                row = db.loc[idx]
+            st.info("🔄 Auto-calculating missing mass loadings...")
+            for idx in db_work.index[missing_ml]:
+                row = db_work.loc[idx]
+                substrate_mass_g = get_substrate_mass_g(
+                    row.get("Substrate", ""), 
+                    row.get("Diameter (mm)", 13.0)
+                )
+                
                 total_ml, active_ml = calc_mass_loading_total_and_active(
                     disk_mass_g=row.get("Mass (g)", np.nan),
-                    diameter_mm=row.get("Diameter (mm)", np.nan),
-                    substrate=row.get("Substrate", ""),
+                    diameter_mm=row.get("Diameter (mm)", 13.0),
+                    substrate_mass_g=substrate_mass_g,
                     active_pct=row.get("Active Material %", np.nan),
                 )
-                db.at[idx, "Mass Loading (mg/cm²)"] = total_ml
-                db.at[idx, "Active ML (mg/cm²)"] = active_ml
-            # Persist back
-            try:
-                save_database(db, db_file)
-            except Exception:
-                pass
+                db_work.at[idx, "Mass Loading (mg/cm²)"] = total_ml
+                db_work.at[idx, "Active ML (mg/cm²)"] = active_ml
 
-        # Filter rows
-        use_col = "Active ML (mg/cm²)"  # better predictor for capacity matching
-        df = db[
-            (db["Active Material"].astype(str).str.strip() == str(material).strip())
-            & (~db["Blade Height (µm)"].isna())
-            & (~db[use_col].isna())
+        # Filter data
+        df_filtered = db_work[
+            (db_work["Active Material"] == material) &
+            (db_work["Substrate"] == substrate) &
+            (db_work["Active Material %"].fillna(0) >= active_pct_min) &
+            (db_work["Solid %"].fillna(0) >= solid_pct_min) &
+            (db_work["Blade Height (µm)"].notna()) &
+            (db_work["Active ML (mg/cm²)"].notna()) &
+            (db_work["Active ML (mg/cm²)"] > 0) &
+            (db_work["Blade Height (µm)"] > 0)
         ].copy()
 
-        if substrate.strip():
-            df = df[df["Substrate"].astype(str).str.strip().str.lower() == substrate.strip().lower()]
-        if tol_active > 0:
-            df = df[df["Active Material %"].fillna(0) >= tol_active]
-        if tol_solid > 0:
-            df = df[df["Solid %"].fillna(0) >= tol_solid]
+        if df_filtered.empty:
+            st.error("❌ No data points meet your criteria. Try relaxing the filters.")
+            return
+        
+        if len(df_filtered) < 3:
+            st.warning(f"⚠️ Only {len(df_filtered)} data points found. Need at least 3 for reliable regression.")
+            if len(df_filtered) < 2:
+                return
 
-        if df.empty:
-            st.error("No matching rows after filters. Relax filters or add data.")
-            st.stop()
+        # Show filtered data preview
+        with st.expander(f"📋 Preview Filtered Data ({len(df_filtered)} points)"):
+            display_cols = ["Blade Height (µm)", "Active ML (mg/cm²)", "Solid %", "Active Material %", "Date Made"]
+            st.dataframe(df_filtered[display_cols].round(3))
 
-        # X: blade height (µm). Convert to "10 µm ticks" to align with earlier visuals
-        x_ticks = df["Blade Height (µm)"].astype(float) / 10.0
-        y_ml = df[use_col].astype(float)
+        # Regression analysis
+        x_ticks = df_filtered["Blade Height (µm)"].astype(float) / 10.0  # Convert to 10µm units
+        y_ml = df_filtered["Active ML (mg/cm²)"].astype(float)
 
-        target_loading = st.number_input("Target Active Mass Loading (mg/cm²)", min_value=0.0, step=0.1, value=float(np.nan_to_num(y_ml.median(), nan=2.0)))
-        slope, intercept, *_ = linregress(x_ticks, y_ml)
+        # Target mass loading input
+        st.subheader("🎯 Target Mass Loading")
+        median_ml = float(y_ml.median())
+        target_loading = st.number_input(
+            "Target Active Mass Loading (mg/cm²)", 
+            min_value=0.0, 
+            step=0.1,
+            value=median_ml,
+            help=f"Current data range: {y_ml.min():.2f} - {y_ml.max():.2f} mg/cm²"
+        )
+
+        # Perform regression
+        slope, intercept, r_value, _, std_err = linregress(x_ticks, y_ml)
         required_tick = (target_loading - intercept) / slope if slope != 0 else None
         required_um = required_tick * 10.0 if required_tick is not None else None
 
+        # Confidence assessment
         min_m, max_m = y_ml.min(), y_ml.max()
         if min_m <= target_loading <= max_m:
-            confidence, uncertainty = "High", 0.10
-        elif target_loading >= min_m * 0.75 and target_loading <= max_m * 1.25:
-            confidence, uncertainty = "Medium", 0.25
+            confidence = "High ✅"
+            conf_color = "green"
+        elif target_loading >= min_m * 0.8 and target_loading <= max_m * 1.2:
+            confidence = "Medium ⚠️"
+            conf_color = "orange"
         else:
-            confidence, uncertainty = "Low", 0.50
+            confidence = "Low ❌"
+            conf_color = "red"
 
+        # Plot regression
         color = COLORS.get(material, 'black')
         plot_regression(
             x_ticks.values, y_ml.values,
             xlabel="Blade Height (10 μm)", ylabel="Active ML (mg/cm²)",
-            material_label=f"{material} (DB)",
+            material_label=f"{material} on {substrate}",
             color=color,
             target_y=target_loading,
             recommended_x=required_tick,
             x_is_ticks=True
         )
 
+        # Results
         if required_um is not None and np.isfinite(required_um):
-            st.success(f"Recommended Blade Height: **{required_um:.1f} µm**  "
-                       f"(= {required_tick:.2f} × 10 µm)")
-            st.info(f"Confidence: **{confidence}** | Estimated Uncertainty: ±{uncertainty*required_um:.1f} µm")
+            st.success(f"🎯 **Recommended Blade Height: {required_um:.1f} µm**")
+            st.markdown(f"**Confidence Level:** :{conf_color}[{confidence}]")
+            
+            if confidence.startswith("Low"):
+                st.warning("⚠️ Target is outside your data range. Consider adding more data points or adjusting target.")
         else:
-            st.error("Slope is zero or invalid. Cannot compute recommendation.")
+            st.error("❌ Cannot calculate recommendation (invalid slope).")
 
-        with st.expander("Show regression numbers"):
-            st.write(f"slope = {slope:.6f} (mg/cm² per 10 µm)")
-            st.write(f"intercept = {intercept:.6f} (mg/cm²)")
-            st.write(f"R² = {linregress(x_ticks, y_ml).rvalue**2:.4f}")
+        # Regression details
+        with st.expander("📊 Regression Statistics"):
+            st.markdown(f"""
+            - **Slope:** {slope:.4f} mg/cm² per 10µm
+            - **Intercept:** {intercept:.4f} mg/cm²  
+            - **R²:** {r_value**2:.4f}
+            - **Data Points:** {len(df_filtered)}
+            - **Blade Height Range:** {x_ticks.min()*10:.0f} - {x_ticks.max()*10:.0f} µm
+            """)
 
     else:
-        # Built-in dataset mode (legacy)
+        # Keep the existing built-in dataset code unchanged
         st.info("Using built-in historical dataset.")
         side = st.selectbox("Side", ["Cathode", "Anode"])
         if side == "Cathode":
@@ -595,83 +810,40 @@ def blade_height_recommender():
 
         active_ratio = st.number_input("Active Material % in Formula", 0.0, 100.0, value=96.0, step=0.1)
         thicknesses, mass_loadings = [], []
-        for t, masses in samples.items():
+
+        for thickness, masses in samples.items():
             avg_m = np.mean(masses)
-            # Convert to active mass loading mg/cm²
             ml = (avg_m - foil_mass) * (active_ratio / 100.0) / ELECTRODE_AREA_13MM * 1000.0
-            thicknesses.append(t)
+            thicknesses.append(thickness)
             mass_loadings.append(ml)
 
         target_loading = st.number_input("Target Active Mass Loading (mg/cm²)", 0.0, 100.0, value=2.0, step=0.1)
-        slope, intercept, *_ = linregress(thicknesses, mass_loadings)
+        slope, intercept, r_value, _, std_err = linregress(thicknesses, mass_loadings)
         required_thickness = (target_loading - intercept) / slope if slope != 0 else None
-
-        min_m, max_m = min(mass_loadings), max(mass_loadings)
-        if min_m <= target_loading <= max_m:
-            confidence, uncertainty = "High", 0.10
-        elif target_loading >= min_m * 0.75 and target_loading <= max_m * 1.25:
-            confidence, uncertainty = "Medium", 0.25
-        else:
-            confidence, uncertainty = "Low", 0.50
 
         color = COLORS.get(material, 'black')
         plot_regression(
             np.array(thicknesses), np.array(mass_loadings),
             xlabel="Blade Height (10 μm)", ylabel="Active ML (mg/cm²)",
-            material_label=material, color=color,
-            target_y=target_loading, recommended_x=required_thickness, x_is_ticks=True
+            material_label=material,
+            color=color,
+            target_y=target_loading,
+            recommended_x=required_thickness,
+            x_is_ticks=True
         )
 
         if required_thickness is not None and np.isfinite(required_thickness):
-            st.success(f"Recommended Blade Height: **{required_thickness*10.0:.1f} µm**  "
-                       f"(= {required_thickness:.2f} × 10 µm)")
-            st.info(f"Confidence: **{confidence}** | Estimated Uncertainty: ±{(uncertainty*required_thickness*10):.1f} µm")
+            st.success(f"Recommended Blade Height: **{required_thickness*10.0:.1f} μm**  "
+                       f"(= {required_thickness:.2f} × 10 μm)")
         else:
-            st.error("Could not calculate blade height (slope is zero).")
-
-    if src == "Use Database" and not df.empty:
-        with st.expander("📘 Blade Height Calculation Details"):
-            st.markdown("### Regression Analysis")
-            st.markdown(f"""
-            **Dataset:**
-            - Material: {material}
-            - Substrate: {substrate if substrate else 'Any'}
-            - Data points: {len(df)}
-            - Active ML range: {y_ml.min():.2f} to {y_ml.max():.2f} mg/cm²
-            - Blade height range: {x_ticks.min()*10:.1f} to {x_ticks.max()*10:.1f} µm
-            """)
+            st.error("Slope is zero or invalid. Cannot compute recommendation.")
             
-            st.markdown("**Linear Regression:**")
-            st.markdown(f"""
-            Equation: y = slope × x + intercept  
-            Where:  
-            - y = Active Mass Loading (mg/cm²)  
-            - x = Blade Height (in 10µm units)
-            
-            Calculated:  
-            - Slope: {slope:.4f} mg/cm² per 10µm  
-            - Intercept: {intercept:.4f} mg/cm²  
-            - R²: {r**2:.4f}
-            """)
-            
-            st.markdown(f"""
-            **Target Calculation:**  
-            Required Active ML = {target_loading:.2f} mg/cm²  
-            Solving for x:  
-            x = (y - intercept) / slope  
-              = ({target_loading:.2f} - {intercept:.4f}) / {slope:.4f}  
-              = {required_tick:.2f} (in 10µm units)  
-            
-            Final Blade Height = {required_tick:.2f} × 10 = {required_um:.1f} µm
-            """)
-
-
-
 # =========================
 # Capacity Match Tool (DB-aware)
 # =========================
+
 def capacity_match_tool():
-    st.title("Capacity Match Tool")
+    st.title("🔋 CapMatch - Capacity Match Tool")
     st.caption("Match cathode/anode areal capacity and estimate blade height using built-in data or your database.")
 
     db = load_database(db_file)
@@ -686,9 +858,9 @@ def capacity_match_tool():
 
     # Ratio
     if side_target == "Anode":
-        capacity_ratio = st.number_input("Anode/Cathode ratio (N/P)", 0.1, 5.0, value=1.0, step=0.01, format="%.2f")
+        capacity_ratio = st.number_input("Anode/Cathode ratio (N/P)", 0.1, 5.0, value=1.0, step=0.01, format="%.3f")
     else:
-        capacity_ratio = st.number_input("Cathode/Anode ratio (P/N)", 0.1, 5.0, value=1.0, step=0.01, format="%.2f")
+        capacity_ratio = st.number_input("Cathode/Anode ratio (P/N)", 0.1, 5.0, value=1.0, step=0.01, format="%.3f")
 
     # Target side properties
     target_material = st.text_input(f"{side_target} material", value="Graphite" if side_target=="Anode" else "LVP")
@@ -696,11 +868,10 @@ def capacity_match_tool():
     target_specific_capacity = st.number_input(f"{side_target} Specific Capacity (mAh/g)", 0.0, 1000.0, value=350.0 if side_target=="Anode" else 120.0, step=0.1)
 
     # Areal capacities
-    known_areal_capacity = known_ml * known_specific_capacity / 1000.0  # mAh/cm²
+    known_areal_capacity = known_ml * known_specific_capacity / 1000.0
     target_areal_capacity = known_areal_capacity * capacity_ratio
+    required_target_ml = target_areal_capacity / target_specific_capacity * 1000.0
 
-    # Required target active mass loading
-    required_target_ml = target_areal_capacity / target_specific_capacity * 1000.0  # mg/cm² of active
     st.subheader("Areal capacity results")
     st.markdown(f"- Known areal capacity: **{known_areal_capacity:.3f} mAh/cm²**")
     st.markdown(f"- Target areal capacity: **{target_areal_capacity:.3f} mAh/cm²**")
@@ -713,39 +884,52 @@ def capacity_match_tool():
     if src == "Use Database":
         if db.empty:
             st.warning("Database empty. Use Electrode Database Manager to add data.")
-            st.stop()
+            return
 
-        substrate_filter = st.text_input("Filter by substrate (optional, exact match)", value="")
-        df = db[
-            (db["Active Material"].astype(str).str.strip().str.lower() == target_material.strip().lower())
-            & (~db["Blade Height (µm)"].isna())
-        ].copy()
-
-        # compute active ML if missing
-        miss = df["Active ML (mg/cm²)"].isna()
-        if miss.any():
-            for idx in df.index[miss]:
-                row = df.loc[idx]
+        # Simplified material selection
+        available_materials = [m for m in db["Active Material"].dropna().unique() if str(m).strip().lower() == target_material.strip().lower()]
+        
+        if not available_materials:
+            st.error(f"Material '{target_material}' not found in database. Available materials: {list(db['Active Material'].dropna().unique())}")
+            return
+            
+        # Auto-calculate missing mass loadings
+        db_work = db.copy()
+        missing_ml = db_work["Active ML (mg/cm²)"].isna()
+        if missing_ml.any():
+            for idx in db_work.index[missing_ml]:
+                row = db_work.loc[idx]
+                substrate_mass_g = get_substrate_mass_g(
+                    row.get("Substrate", ""), 
+                    row.get("Diameter (mm)", 13.0)
+                )
+                
                 total_ml, active_ml = calc_mass_loading_total_and_active(
                     disk_mass_g=row.get("Mass (g)", np.nan),
-                    diameter_mm=row.get("Diameter (mm)", np.nan),
-                    substrate=row.get("Substrate", ""),
+                    diameter_mm=row.get("Diameter (mm)", 13.0),
+                    substrate_mass_g=substrate_mass_g,
                     active_pct=row.get("Active Material %", np.nan),
                 )
-                df.at[idx, "Mass Loading (mg/cm²)"] = total_ml
-                df.at[idx, "Active ML (mg/cm²)"] = active_ml
+                db_work.at[idx, "Active ML (mg/cm²)"] = active_ml
 
-        if substrate_filter.strip():
-            df = df[df["Substrate"].astype(str).str.strip().str.lower() == substrate_filter.strip().lower()]
+        # Filter for target material
+        df = db_work[
+            (db_work["Active Material"].str.lower() == target_material.lower()) &
+            (db_work["Blade Height (µm)"].notna()) &
+            (db_work["Active ML (mg/cm²)"].notna()) &
+            (db_work["Active ML (mg/cm²)"] > 0)
+        ].copy()
 
-        df = df.dropna(subset=["Active ML (mg/cm²)", "Blade Height (µm)"])
         if df.empty:
-            st.error("No usable rows for regression after filters.")
-            st.stop()
+            st.error("No usable data for this material in database.")
+            return
+
+        st.info(f"Found {len(df)} data points for {target_material}")
 
         x_ticks = df["Blade Height (µm)"].astype(float) / 10.0
         y_active_ml = df["Active ML (mg/cm²)"].astype(float)
-        slope, intercept, *_ = linregress(x_ticks, y_active_ml)
+        
+        slope, intercept, r_value, _, _ = linregress(x_ticks, y_active_ml)
         req_tick = (required_target_ml - intercept) / slope if slope != 0 else None
         req_um = req_tick * 10.0 if req_tick is not None else None
 
@@ -758,22 +942,22 @@ def capacity_match_tool():
         )
 
         if req_um is not None and np.isfinite(req_um):
-            st.success(f"Recommended {side_target} blade height: **{req_um:.1f} µm**")
+            st.success(f"Recommended {side_target} blade height: **{req_um:.1f} μm**")
         else:
             st.error("Regression invalid. Cannot recommend height.")
 
     else:
-        # Built-in data
+        # Keep the existing built-in data code unchanged
         if side_target == "Cathode":
             if target_material not in CATHODE_DATA:
                 st.error("Target material not found in built-in cathode dataset.")
-                st.stop()
+                return
             samples = CATHODE_DATA[target_material]
             foil_mass = AL_FOIL_MASS_13MM
         else:
             if target_material not in ANODE_DATA:
                 st.error("Target material not found in built-in anode dataset.")
-                st.stop()
+                return
             samples = ANODE_DATA[target_material]
             foil_mass = CU_FOIL_MASS_13MM
 
@@ -794,7 +978,7 @@ def capacity_match_tool():
             target_y=required_target_ml, recommended_x=req_tick, x_is_ticks=True
         )
         if req_tick is not None and np.isfinite(req_tick):
-            st.success(f"Recommended {side_target} blade height: **{req_tick*10.0:.1f} µm**")
+            st.success(f"Recommended {side_target} blade height: **{req_tick*10.0:.1f} μm**")
         else:
             st.error("Regression invalid. Cannot recommend height.")
 
@@ -828,22 +1012,6 @@ def capacity_match_tool():
            = ({target_areal_capacity:.3f} × 1000) / ({target_active_ratio:.2f} × {target_specific_capacity:.1f})  
            = {required_target_ml:.3f} mg/cm²
         """)
-        
-        if src == "Use Database" and not df.empty:
-            st.markdown("**Blade Height Estimation:**")
-            st.markdown(f"""
-            Using database regression for {target_material}:
-            - Slope: {slope:.4f} mg/cm² per 10µm
-            - Intercept: {intercept:.4f} mg/cm²
-            - R²: {r**2:.4f}
-            
-            Required Blade Height Calculation:
-            x = (y - intercept) / slope  
-              = ({required_target_ml:.3f} - {intercept:.4f}) / {slope:.4f}  
-              = {req_tick:.2f} (in 10µm units)  
-            
-            Final Blade Height = {req_tick:.2f} × 10 = {req_um:.1f} µm
-            """)
 
 
 # =========================
@@ -851,461 +1019,1305 @@ def capacity_match_tool():
 # =========================
 
 def coating_calibration_tool():
-    st.title("Coating Calibration Tool")
+    st.title("⚙️ Coating Calibration Tool")
     st.markdown("Create a custom coating matrix to visualize coating uniformity.")
 
-    batch_mode = st.checkbox(
-        "Enable Batch Mode (Compare Multiple Coating Runs)",
-        help="Toggle to allow input of multiple batches for comparison."
-    )
-    n_batches = st.number_input("Number of batches", 1, 5, 1, step=1) if batch_mode else 1
+    # --- Grid size ---
+    n_rows = st.number_input("Number of rows", 1, 10, 3, step=1)
+    n_cols = st.number_input("Number of columns", 1, 10, 3, step=1)
 
-    n_rows = st.number_input("Number of rows", 1, 10, 3, step=1, help="Number of rows in your coating matrix.")
-    n_cols = st.number_input("Number of columns", 1, 10, 3, step=1, help="Number of columns in your coating matrix.")
-
-    # Global Parameters in Expander
-    with st.expander("Global Parameters", expanded=False):
+    # --- Globals ---
+    with st.expander("Global Parameters", expanded=True):
         g_active = st.text_input("Active Material", "LVP", help="Name of the active material used.")
-        g_substrate = st.text_input("Substrate", "Aluminum foil", help="Type of substrate being coated.")
-        g_diameter = st.number_input(
-            "Diameter (mm)", 0.1, 100.0, 13.0, step=0.00001, format="%.5f",
-            help="Diameter of the coated disc in mm."
-        )
-        g_solid = st.number_input(
-            "Solid (%)", 0.0, 100.0, 30.0, step=0.00001, format="%.5f",
-            help="Solid content of the coating solution."
-        )
+        g_substrate = st.selectbox("Substrate", [s[0] for s in substrates_dropdown], index=0)
+        default_foil_mass = pick_foil_mass(g_substrate)
+
+        use_custom_tare = st.checkbox("Override Tare?", value=False)
+        if use_custom_tare:
+            g_custom_tare = st.number_input(
+                "Custom Tare (mg/cm²)", min_value=0.0, value=float(default_foil_mass), step=0.01,
+                help="Optionally override the substrate mass per area."
+            )
+        else:
+            g_custom_tare = default_foil_mass
+
+        g_diameter = st.number_input("Diameter (mm)", min_value=0.1, max_value=100.0, value=13.0, step=0.01)
+        g_solid = st.number_input("Solid (%)", 0.0, 100.0, 30.0, step=0.00001, format="%.5f")
         g_active_pct = st.number_input(
-            "Active Material (%)", 0.0, 100.0, 96.0, step=0.00001, format="%.5f",
-            help="Percentage of active material in the solid content."
+            "Active Material %", min_value=0.0, max_value=100.0,
+            value=MATERIAL_ACTIVE_RATIOS.get(g_active, 96.0), step=0.1
         )
-        g_blade = st.number_input(
-            "Blade Height (µm)", 1, 1000, 200, step=1,
-            help="Height of the coating blade used for spreading."
-        )
+        g_blade = st.number_input("Blade Height (µm)", 1, 1000, 200, step=1)
 
-    sensitivity = st.slider(
-        "Heatmap Sensitivity (%)", 1, 100, 10,
-        help="Controls how sensitive the heatmap colors are to deviations."
-    )
-
-    # Heatmap mode selection
     heatmap_mode = st.radio(
         "Select Heatmap Type",
         ["Deviation", "Critical Deviation", "Spec/Out-of-Spec"],
-        help="Select the type of heatmap to display: "
-             "Deviation shows % deviation from mean; "
-             "Critical Deviation highlights cells exceeding the critical threshold; "
-             "Spec/Out-of-Spec highlights cells outside the specification range."
+        help="Deviation = % from mean; Critical = flag |deviation| > threshold; Spec = inside range."
     )
 
-    # Show relevant flag input based on selected heatmap mode
     if heatmap_mode == "Critical Deviation":
-        crit_value = st.number_input(
-            "Critical Deviation (%)",
-            0.0, 100.0, 5.0, step=0.1,
-            help="Cells with deviation from mean exceeding this percentage will be flagged."
-        )
+        crit_value = st.number_input("Critical Deviation (%)", 0.0, 100.0, 5.0, step=0.1)
     elif heatmap_mode == "Spec/Out-of-Spec":
-        spec_min = st.number_input(
-            "Spec Min Active ML (mg/cm²)",
-            0.0, 10.0, 1.5, step=0.01,
-            help="Minimum acceptable active ML; below this will be flagged."
-        )
-        spec_max = st.number_input(
-            "Spec Max Active ML (mg/cm²)",
-            0.0, 10.0, 2.5, step=0.01,
-            help="Maximum acceptable active ML; above this will be flagged."
-        )
+        spec_min = st.number_input("Spec Min Active ML (mg/cm²)", 0.0, 50.0, 1.5, step=0.1, format="%.5f")
+        spec_max = st.number_input("Spec Max Active ML (mg/cm²)", 0.0, 100.0, 50.0, step=0.1, format="%.5f")
 
-    batches = []
-    for batch_num in range(n_batches):
-        if batch_mode:
-            st.subheader(f"Batch {batch_num + 1}")
-        use_global_batch = st.checkbox(f"Use global parameters for Batch {batch_num+1}", True)
+    # --- Matrix inputs ---
+    matrix = {}
+    for row in range(n_rows):
+        cols_layout = st.columns(n_cols + 1)
+        with cols_layout[0]:
+            st.markdown(f"**Row {row+1}**")
+        for col in range(n_cols):
+            with cols_layout[col + 1]:
+                mass = st.number_input(
+                    "Measured Mass (g)", 0.0, 10.0, 0.02000, step=0.00001, format="%.5f",
+                    key=f"m_{row}_{col}"
+                )
+                radius_cm = g_diameter / 10.0 / 2.0
+                area_cm2 = 3.14159265 * radius_cm**2
+                total_ml = (mass * 1000.0) / area_cm2  # mg/cm^2
+                active_ml = total_ml * (g_active_pct)
 
-        matrix = {}
-        for row in range(n_rows):
-            cols_layout = st.columns(n_cols + 1)
-            with cols_layout[0]:
-                st.markdown(f"**Row {row+1}**")
-            for col in range(n_cols):
-                if not use_global_batch:
-                    with cols_layout[col + 1]:
-                        active = st.text_input("Active Material", g_active, key=f"act_{batch_num}_{row}_{col}")
-                        substrate = st.text_input("Substrate", g_substrate, key=f"sub_{batch_num}_{row}_{col}")
-                        diameter = st.number_input(
-                            "Diameter (mm)", 0.1, 100.0, g_diameter, step=0.00001, format="%.5f",
-                            key=f"dia_{batch_num}_{row}_{col}"
-                        )
-                        solid = st.number_input(
-                            "Solid (%)", 0.0, 100.0, g_solid, step=0.00001, format="%.5f",
-                            key=f"sol_{batch_num}_{row}_{col}"
-                        )
-                        active_pct = st.number_input(
-                            "Active Material (%)", 0.0, 100.0, g_active_pct, step=0.00001,
-                            format="%.5f", key=f"actp_{batch_num}_{row}_{col}"
-                        )
-                        blade = st.number_input(
-                            "Blade Height (µm)", 1, 1000, g_blade, step=1, key=f"bl_{batch_num}_{row}_{col}"
-                        )
-                else:
-                    active, substrate, diameter, solid, active_pct, blade = g_active, g_substrate, g_diameter, g_solid, g_active_pct, g_blade
+                data_flag = "MISSING MASS" if mass <= 0 else ""
 
-                with cols_layout[col + 1]:
-                    mass = st.number_input(
-                        "Measured Mass (g)", 0.0, 10.0, 0.02000, step=0.00001, format="%.5f",
-                        key=f"m_{batch_num}_{row}_{col}"
+                matrix[(row, col)] = {
+                    'active': g_active,
+                    'substrate': g_substrate,
+                    'diameter': g_diameter,
+                    'solid': g_solid,
+                    'active_pct': g_active_pct,
+                    'blade': g_blade,
+                    'mass': mass,
+                    'total_ml': total_ml,
+                    'active_ml': active_ml,
+                    'flag': data_flag
+                }
+
+    # --- Analysis (auto) ---
+    ml_values = np.zeros((n_rows, n_cols), dtype=float)
+    for (r, c), d in matrix.items():
+        ml_values[r, c] = d['active_ml'] if not np.isnan(d['active_ml']) else 0.0
+
+    valid_mask = ml_values > 0.0
+    if np.any(valid_mask):
+        mean_ml = float(np.nanmean(ml_values[valid_mask]))
+        deviations = ((ml_values - mean_ml) / mean_ml) * 100.0
+    else:
+        mean_ml = 0.0
+        deviations = np.zeros_like(ml_values)
+
+    row_labels = [f"Row {r+1}" for r in range(n_rows)]
+    col_labels = [f"Col {c+1}" for c in range(n_cols)]
+
+    # Update flags
+    for (r, c), d in matrix.items():
+        if heatmap_mode == "Critical Deviation" and abs(deviations[r, c]) > crit_value:
+            d['flag'] = (d['flag'] + "; CRITICAL DEV") if d['flag'] else "CRITICAL DEV"
+        elif heatmap_mode == "Spec/Out-of-Spec":
+            if not (spec_min <= ml_values[r, c] <= spec_max):
+                d['flag'] = (d['flag'] + "; OUT OF SPEC") if d['flag'] else "OUT OF SPEC"
+
+    # --- Heatmap with labels + colorbar ---
+    st.subheader("Heatmap Plot")
+
+    hover_text = [
+        [f"ML={ml_values[r,c]:.2f} mg/cm²<br>Deviation={deviations[r,c]:.2f}%"
+         for c in range(n_cols)]
+        for r in range(n_rows)
+    ]
+
+    if heatmap_mode == "Deviation":
+        fig_heat = go.Figure(data=go.Heatmap(
+            z=deviations,
+            x=col_labels, y=row_labels,
+            text=hover_text, hovertemplate="%{text}<extra></extra>",
+            # colorscale='portland', ## Alternative colorscale test
+            colorscale = [
+                [0, 'red'],
+                [0.25, 'orange'],
+                [0.5, 'limegreen'],
+                [0.75, 'orange'],
+                [1, 'red']
+            ],
+            zmid=0.0,
+            colorbar=dict(title="% Deviation from Mean")
+        ))
+        # Percent annotations
+        for r in range(n_rows):
+            for c in range(n_cols):
+                fig_heat.add_annotation(
+                    x=col_labels[c], y=row_labels[r],
+                    text=f"{deviations[r,c]:.1f}%",
+                    showarrow=False, font=dict(color="black", size=15)
+                )
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+    elif heatmap_mode == "Critical Deviation":
+        crit_status = np.where(np.abs(deviations) > crit_value, 1, 0)  # 1 = critical, 0 = OK
+
+        # Binary colorscale: 0 -> green (OK), 1 -> red (Critical)
+        colorscale = [[0, 'limegreen'], [1, 'red']]
+
+        fig_crit = go.Figure(data=go.Heatmap(
+            z=crit_status,
+            x=col_labels,
+            y=row_labels,
+            text=hover_text,
+            hovertemplate="%{text}<extra></extra>",
+            colorscale=colorscale,
+            zmin=0,
+            zmax=1,
+            showscale=True,
+            colorbar=dict(title="Critical Status", tickvals=[0,1], ticktext=["OK","Critical"])
+        ))
+
+        # Large bold O/X annotations with automatic font color
+        for r in range(n_rows):
+            for c in range(n_cols):
+                cell_value = crit_status[r,c]
+                fig_crit.add_annotation(
+                    x=col_labels[c],
+                    y=row_labels[r],
+                    text=("X" if cell_value == 1 else "O"),
+                    showarrow=False,
+                    font=dict(
+                        color="white" if cell_value == 1 else "black",
+                        size=24,
+                        family="Arial Black" 
                     )
-                    total_ml, active_ml = calc_mass_loading_total_and_active(mass, diameter, substrate, active_pct)
-
-                    data_flag = ""
-                    if mass <= 0:
-                        data_flag = "MISSING MASS"
-
-                    matrix[(row, col)] = {
-                        'active': active,
-                        'substrate': substrate,
-                        'diameter': diameter,
-                        'solid': solid,
-                        'active_pct': active_pct,
-                        'blade': blade,
-                        'mass': mass,
-                        'total_ml': total_ml,
-                        'active_ml': active_ml,
-                        'flag': data_flag
-                    }
-        batches.append(matrix)
-
-    if st.button("Generate Analysis"):
-        combined_writer = BytesIO()
-        with pd.ExcelWriter(combined_writer, engine='openpyxl') as writer:
-            for i, matrix in enumerate(batches):
-                ml_values = np.zeros((n_rows, n_cols))
-                for (row, col), data in matrix.items():
-                    ml_values[row, col] = data['active_ml'] if not np.isnan(data['active_ml']) else 0
-
-                mean_ml = np.nanmean(ml_values[ml_values > 0])
-                deviations = ((ml_values - mean_ml) / mean_ml) * 100
-
-                row_labels = [f"Row {r+1}" for r in range(n_rows)]
-                col_labels = [f"Col {c+1}" for c in range(n_cols)]
-
-                # Auto-flagging based on selected heatmap mode
-                for (r, c), data in matrix.items():
-                    if heatmap_mode == "Critical Deviation" and abs(deviations[r, c]) > crit_value:
-                        data['flag'] = data['flag'] + "; CRITICAL DEV" if data['flag'] else "CRITICAL DEV"
-                    elif heatmap_mode == "Spec/Out-of-Spec" and (data['active_ml'] < spec_min or data['active_ml'] > spec_max):
-                        data['flag'] = data['flag'] + "; OUT OF SPEC" if data['flag'] else "OUT OF SPEC"
-
-                st.subheader(f"Batch {i+1} Heatmap")
-
-                # Heatmap plotting
-                if heatmap_mode == "Deviation":
-                    fig_heat = go.Figure(data=go.Heatmap(
-                        z=deviations, x=col_labels, y=row_labels,
-                        text=np.round(deviations, 2),
-                        hovertemplate="Row: %{y}<br>Col: %{x}<br>Deviation: %{text} %<extra></extra>",
-                        colorscale='RdBu', zmid=0  # blue-red for deviation
-                    ))
-                    st.plotly_chart(fig_heat)
-
-                elif heatmap_mode == "Critical Deviation":
-                    crit_map = np.full_like(ml_values, np.nan)
-                    for r in range(n_rows):
-                        for c in range(n_cols):
-                            if abs(deviations[r, c]) > crit_value:
-                                crit_map[r, c] = deviations[r, c]
-                    fig_crit = go.Figure(data=go.Heatmap(
-                        z=crit_map, x=col_labels, y=row_labels,
-                        text=np.round(crit_map, 2),
-                        hovertemplate="Row: %{y}<br>Col: %{x}<br>Deviation: %{text} %<extra></extra>",
-                        colorscale='Oranges',  # orange scale for critical deviations
-                        showscale=True
-                    ))
-                    st.plotly_chart(fig_crit)
-
-                else:  # Spec/Out-of-Spec
-                    spec_map = np.full_like(ml_values, np.nan)
-                    for r in range(n_rows):
-                        for c in range(n_cols):
-                            if ml_values[r, c] < spec_min or ml_values[r, c] > spec_max:
-                                spec_map[r, c] = ml_values[r, c]
-                    fig_spec = go.Figure(data=go.Heatmap(
-                        z=spec_map, x=col_labels, y=row_labels,
-                        text=np.round(spec_map, 2),
-                        hovertemplate="Row: %{y}<br>Col: %{x}<br>Active ML: %{text} mg/cm²<extra></extra>",
-                        colorscale='RdYlGn_r',  # red-green reversed for out-of-spec emphasis
-                        showscale=True
-                    ))
-                    st.plotly_chart(fig_spec)
-
-                # 3D Surface plot
-                mean_ml = np.nanmean(ml_values[ml_values > 0])  # calculate mean excluding zeros/nans
-                mean_plane = np.full_like(ml_values, mean_ml)
-
-                fig_3d = go.Figure()
-
-                # Surface of actual measurements
-                fig_3d.add_trace(go.Surface(
-                    z=ml_values,
-                    x=np.arange(1, n_cols+1),
-                    y=np.arange(1, n_rows+1),
-                    colorscale='Viridis',
-                    name='Measured ML',
-                    showscale=True
-                ))
-
-                # Mean plane
-                fig_3d.add_trace(go.Surface(
-                    z=mean_plane,
-                    x=np.arange(1, n_cols+1),
-                    y=np.arange(1, n_rows+1),
-                    surfacecolor=np.full_like(mean_plane, mean_ml),
-                    colorscale=[[0, 'grey'], [1, 'grey']],  # fixed color
-                    showscale=False,
-                    opacity=0.4,
-                    name='Mean ML'
-                ))
-
-                # Adjust layout to compress Y-axis and make Z less exaggerated
-                fig_3d.update_layout(
-                    scene=dict(
-                        xaxis_title="Columns",
-                        yaxis_title="Rows",
-                        zaxis_title="Active ML (mg/cm²)",
-                        aspectratio=dict(x=1, y=1, z=0.3),  # x, y, and z aspect ratios
-                        camera=dict(eye=dict(x=1.5, y=1.5, z=0.8))  # optional nicer angle
-                    ),
-                    legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
                 )
 
-                st.plotly_chart(fig_3d)
+        st.plotly_chart(fig_crit, use_container_width=True)
 
-                # Uniformity and stats
-                valid_ml = [v['active_ml'] for v in matrix.values() if not np.isnan(v['active_ml'])]
-                if valid_ml:
-                    uniformity_score = 100*(1 - (np.std(valid_ml)/np.mean(valid_ml)))
-                    st.metric("Uniformity Score", f"{uniformity_score:.2f}%")
-                    st.write("**Statistical Summary**")
-                    st.markdown(f"""
-                    - Mean: {np.mean(valid_ml):.5f} mg/cm²
-                    - Std Dev: {np.std(valid_ml):.5f} mg/cm²
-                    - Range: {np.min(valid_ml):.5f} - {np.max(valid_ml):.5f} mg/cm²
-                    - Max Deviation: {np.max(np.abs(deviations)):.5f}%
-                    """)
 
-                # Excel export
-                df_data = []
-                for (row, col), data in matrix.items():
-                    df_data.append({
-                        'Row': row+1,
-                        'Column': col+1,
-                        'Active Material': data['active'],
-                        'Substrate': data['substrate'],
-                        'Diameter (mm)': f"{data['diameter']:.5f}",
-                        'Solid (%)': f"{data['solid']:.5f}",
-                        'Active Material (%)': f"{data['active_pct']:.5f}",
-                        'Blade Height (µm)': data['blade'],
-                        'Mass (g)': f"{data['mass']:.5f}",
-                        'Total ML (mg/cm²)': f"{data['total_ml']:.5f}",
-                        'Active ML (mg/cm²)': f"{data['active_ml']:.5f}",
-                        'Deviation (%)': f"{deviations[row,col]:.2f}",
-                        'Flag': data['flag']
-                    })
+    else:  # Spec/Out-of-Spec
+        # 1 = In-spec (green), 0 = Out-of-spec (red)
+        spec_map = np.where((ml_values >= spec_min) & (ml_values <= spec_max), 1, 0).astype(float)
 
-                df = pd.DataFrame(df_data)
+        # Binary colorscale: 0 -> red (Out-of-spec), 1 -> green (In-spec)
+        colorscale = [[0, 'red'], [1, 'limegreen']]
 
-                # Add stats as separate rows at the bottom
-                stats_rows = pd.DataFrame([{
-                    'Row': 'STAT',
-                    'Column': '',
-                    'Active Material': '',
-                    'Substrate': '',
-                    'Diameter (mm)': '',
-                    'Solid (%)': '',
-                    'Active Material (%)': '',
-                    'Blade Height (µm)': '',
-                    'Mass (g)': '',
-                    'Total ML (mg/cm²)': '',
-                    'Active ML (mg/cm²)': f"{np.mean(valid_ml):.5f}",
-                    'Deviation (%)': f"Std: {np.std(valid_ml):.5f}, Range: {np.min(valid_ml):.5f}-{np.max(valid_ml):.5f}, Max Dev: {np.max(np.abs(deviations)):.5f}%, Uniformity: {uniformity_score:.2f}%",
-                    'Flag': ''
-                }])
-                df = pd.concat([df, stats_rows], ignore_index=True)
+        fig_spec = go.Figure(data=go.Heatmap(
+            z=spec_map,
+            x=col_labels,
+            y=row_labels,
+            text=hover_text,
+            hovertemplate="%{text}<extra></extra>",
+            colorscale=colorscale,
+            zmin=0,
+            zmax=1,
+            showscale=True,
+            colorbar=dict(title="Spec Status", tickvals=[0,1], ticktext=["Out","In"])
+        ))
 
-                df.to_excel(writer, sheet_name=f"Batch_{i+1}", index=False)
-
-                st.download_button(
-                    "Download All Batches Excel",
-                    data=combined_writer.getvalue(),
-                    file_name="coating_calibration_report.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        # Large bold O/X annotations with automatic font color
+        for r in range(n_rows):
+            for c in range(n_cols):
+                cell_value = spec_map[r,c]
+                fig_spec.add_annotation(
+                    x=col_labels[c],
+                    y=row_labels[r],
+                    text=("O" if cell_value == 1 else "X"),
+                    showarrow=False,
+                    font=dict(
+                        color="white" if cell_value == 0 else "black",  # contrast with background
+                        size=24,
+                        family="Arial Black" 
+                    )
                 )
 
+        st.plotly_chart(fig_spec, use_container_width=True)
+
+    # --- 3D Plate Representation ---
+    st.subheader("3D Plate Representation")
+
+    plate_width = 101.6  # mm
+    plate_height = 101.6  # mm
+    radius = g_diameter / 2.0
+
+    x_centers = np.linspace(0.0, plate_width, n_cols)
+    y_centers = np.linspace(0.0, plate_height, n_rows)
+
+    X, Y = np.meshgrid(x_centers, y_centers)
+    Z = ml_values
+
+    # Z range for colorbar
+    z_min = float(np.nanmin(Z)) if np.isfinite(np.nanmin(Z)) else 0.0
+    z_max = float(np.nanmax(Z)) if np.isfinite(np.nanmax(Z)) else 1.0
+    if z_max == z_min:
+        z_min -= 1e-6
+        z_max += 1e-6
+    levels = np.linspace(z_min, z_max, 12)
+
+    # Z exaggeration slider (affects geometry only), you can edit the value here
+    z_exaggeration = 1
+
+    Z_exagg = Z * z_exaggeration  # for geometry
+
+    fig_3d = go.Figure()
+
+    # Surface (geometry scaled, color based on actual Z)
+    fig_3d.add_trace(go.Surface(
+        x=X, y=Y, z=Z_exagg,
+        surfacecolor=Z,            # use original data for color
+        colorscale="portland",
+        cmin=z_min, cmax=z_max,
+        opacity=0.85,
+        colorbar=dict(
+            title="Active ML (mg/cm²)",
+            tickvals=levels,
+            ticktext=[f"{v:.2f}" for v in levels]
+        ),
+        contours=dict(
+            z=dict(
+                show=True,
+                start=z_min,
+                end=z_max,
+                size=(z_max - z_min)/12,
+                color="black",
+                width=5
+            )
+        )
+    ))
+
+    # Add electrode disks with exaggerated Z (geometry only)
+    theta = np.linspace(0, 2*np.pi, 50)
+    for i, y0 in enumerate(y_centers):
+        for j, x0 in enumerate(x_centers):
+            z_val = Z_exagg[i,j]
+            circle_x = x0 + radius*np.cos(theta)
+            circle_y = y0 + radius*np.sin(theta)
+            circle_z = np.ones_like(circle_x) * z_val
+
+            verts_x = np.concatenate(([x0], circle_x))
+            verts_y = np.concatenate(([y0], circle_y))
+            verts_z = np.concatenate(([z_val], circle_z))
+
+            I = np.zeros(len(theta), dtype=int)
+            J = np.arange(1, len(theta)+1)
+            K = np.roll(J, -1)
+
+            fig_3d.add_trace(go.Mesh3d(
+                x=verts_x, y=verts_y, z=verts_z,
+                i=I, j=J, k=K,
+                intensity=np.ones_like(verts_z) * Z[i,j],  # color from original Z
+                colorscale="portland",
+                cmin=z_min, cmax=z_max,
+                showscale=False,
+                opacity=1.0
+            ))
+
+
+    base_aspect_z = 0.4  # default for z_exaggeration = 1
+    aspect_z = base_aspect_z * z_exaggeration
+
+    fig_3d.update_layout(
+        scene=dict(
+            xaxis_title="X (mm)",
+            yaxis_title="Y (mm)",
+            zaxis_title="Active ML (exaggerated)",
+            aspectmode="manual",
+            aspectratio=dict(x=1, y=1, z=aspect_z),  # Scales with exaggeration
+        ),
+        margin=dict(l=0,r=0,b=0,t=0)
+    )
+
+    st.plotly_chart(fig_3d, use_container_width=True)
+
+    # --- 2D Contour map ---
+    fig_2d = go.Figure(data=go.Contour(
+        x=x_centers, y=y_centers, z=Z,
+        colorscale="portland",
+        contours=dict(
+            showlines=True,
+            start=z_min, end=z_max, size=(z_max - z_min)/12.0,
+            coloring="heatmap"
+        ),
+        colorbar=dict(
+            title="Active ML (mg/cm²)",
+            tickvals=levels,
+            ticktext=[f"{v:.2f}" for v in levels]
+        )
+    ))
+    fig_2d.update_layout(
+        xaxis_title="X (mm)",
+        yaxis_title="Y (mm)",
+        yaxis=dict(scaleanchor="x", scaleratio=1),
+        margin=dict(l=0, r=0, b=0, t=0)
+    )
+    st.plotly_chart(fig_2d, use_container_width=True)
+
+    # --- Stats ---
+    valid_ml = [v['active_ml'] for v in matrix.values() if not np.isnan(v['active_ml'])]
+    if len(valid_ml) > 0 and np.mean(valid_ml) != 0:
+        uniformity_score = 100.0 * (1.0 - (np.std(valid_ml) / np.mean(valid_ml)))
+        st.metric("Uniformity Score", f"{uniformity_score:.2f}%")
+        st.write("**Statistical Summary**")
+        st.markdown(
+            f"- Mean: {np.mean(valid_ml):.5f} mg/cm²\n"
+            f"- Std Dev: {np.std(valid_ml):.5f} mg/cm²\n"
+            f"- Range: {np.min(valid_ml):.5f} - {np.max(valid_ml):.5f} mg/cm²\n"
+            f"- Max Deviation: {np.max(np.abs(deviations)):.5f}%"
+        )
+
+    # --- Export data (auto-refreshed content, manual download) ---
+    df = pd.DataFrame([{
+        'Row': row + 1,
+        'Column': col + 1,
+        'Active Material': data['active'],
+        'Substrate': data['substrate'],
+        'Diameter (mm)': f"{data['diameter']:.5f}",
+        'Solid (%)': f"{data['solid']:.5f}",
+        'Active Material (%)': f"{data['active_pct']:.5f}",
+        'Blade Height (µm)': data['blade'],
+        'Mass (g)': f"{data['mass']:.5f}",
+        'Total ML (mg/cm²)': f"{data['total_ml']:.5f}",
+        'Active ML (mg/cm²)': f"{data['active_ml']:.5f}",
+        'Deviation (%)': f"{deviations[row, col]:.2f}",
+        'Flag': data['flag']
+    } for (row, col), data in matrix.items()])
+
+    # Excel
+    excel_buffer = BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False)
+    excel_buffer.seek(0)
+    st.download_button(
+        "Download Excel",
+        data=excel_buffer,
+        file_name="coating_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    # CSV
+    csv_buffer = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV",
+        data=csv_buffer,
+        file_name="coating_report.csv",
+        mime="text/csv"
+    )
 
 
 # =========================
 # Electrode Database Manager
 # =========================
-def electrode_database_manager():
-    st.title("Electrode Database Manager")
 
-    # Load or upload DB
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Load / View")
-        db = load_database(db_file)
-        if db.empty:
-            st.info("Database empty.")
-        st.dataframe(db, use_container_width=True)
+def enforce_schema(df: pd.DataFrame) -> pd.DataFrame:
+    required_columns = [
+        "Active Material",
+        "Substrate Name",
+        "Substrate Tare (mg/cm²)",
+        "Diameter (mm)",
+        "Mass (g)",
+        "Solid %",
+        "Blade Height (µm)",
+        "Active Material %",
+        "Mass Loading (mg/cm²)",
+        "Active ML (mg/cm²)",
+        "Date Made",
+        "Made By",
+        "Notes"
+    ]
+    for col in required_columns:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[required_columns]
+    return df
 
-    with c2:
-        st.subheader("Import Excel")
-        up = st.file_uploader("Upload an existing database (.xlsx)", type=["xlsx"])
-        if up is not None:
-            try:
-                new_db = pd.read_excel(up)
-                new_db = ensure_db_columns(new_db)
-                save_database(new_db, db_file)
-                st.success("Database replaced from upload.")
-                db = new_db
-            except Exception as e:
-                st.error(f"Upload failed: {e}")
+# def electrode_database_manager():
+    st.title("🗄️ ElectroDB - Electrode Database Manager")
+    st.caption("Streamlined electrode data management for battery researchers")
 
-    st.subheader("Add New Electrode Entry")
-    with st.form("new_entry_form", clear_on_submit=True):  # This is the main form
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            active_material = st.text_input("Active Material", value="LVP")
-            substrate = st.text_input("Substrate", value="Aluminum foil")
-            diameter_mm = st.number_input("Diameter (mm)", 0.0, 100.0, value=13.0, step=0.01)
-        with c2:
-            mass_g = st.number_input("Disk Mass (g)", 0.0, 10.0, value=0.0200, step=0.0001)
-            solid_pct = st.number_input("Solid %", 0.0, 100.0, value=30.0, step=0.1)
-            blade_um = st.number_input("Blade Height (µm)", 0.0, 1000.0, value=200.0, step=1.0)
-        with c3:
-            active_pct = st.number_input("Active Material %", 0.0, 100.0, value=96.0, step=0.1)
+    # Load database
+    db = load_database(db_file)
 
-            # auto-calc ML
-            total_ml, active_ml = calc_mass_loading_total_and_active(mass_g, diameter_mm, substrate, active_pct)
-
-        st.caption("Mass loading auto-calculated using foil subtraction when substrate is recognized.")
-        if pick_foil_mass(substrate) is None:
-            st.warning("Substrate not recognized. Foil mass not subtracted. Update substrate text to a known key.")
-
-        submitted = st.form_submit_button("Add entry")
-        if submitted:
-            new_row = {
-                "Active Material": active_material,
-                "Substrate": substrate,
-                "Diameter (mm)": diameter_mm,
-                "Mass (g)": mass_g,
-                "Solid %": solid_pct,
-                "Blade Height (µm)": blade_um,
-                "Active Material %": active_pct,
-                "Mass Loading (mg/cm²)": total_ml,
-                "Active ML (mg/cm²)": active_ml,
-            }
-            db = pd.concat([db, pd.DataFrame([new_row])], ignore_index=True)
-            save_database(db, db_file)
-            st.success("Row added.")
-
-    # Move the math breakdown outside the form
-    with st.expander("📘 Mass Loading Calculation Details"):
-        st.markdown("### Mass Loading Formulas")
-        # You'll need to get the last entered values from session state or variables
-        # For demonstration, I'll show the structure - you'll need to adapt based on your data flow
-        st.markdown(f"""
-        **Inputs:**
-        - Disk Mass: {mass_g if 'mass_g' in locals() else 0.0200:.4f} g
-        - Diameter: {diameter_mm if 'diameter_mm' in locals() else 13.0:.2f} mm
-        - Substrate: {substrate if 'substrate' in locals() else 'Aluminum foil'}
-        - Active Material %: {active_pct if 'active_pct' in locals() else 96.0:.1f}%
-        """)
-        
-        foil_mass = pick_foil_mass(substrate if 'substrate' in locals() else 'Aluminum foil')
-        if foil_mass is not None:
-            st.markdown(f"""
-            **Calculations:**
-            1. Area = π × (diameter/2)² / 100  
-               = π × ({diameter_mm if 'diameter_mm' in locals() else 13.0:.2f}/2)² / 100  
-               = {mm_diameter_to_area_cm2(diameter_mm if 'diameter_mm' in locals() else 13.0):.4f} cm²
-            
-            2. Coating Mass = Disk Mass - Foil Mass  
-               = {mass_g if 'mass_g' in locals() else 0.0200:.4f} - {foil_mass:.6f}  
-               = {(mass_g - foil_mass) if 'mass_g' in locals() else (0.0200 - foil_mass):.6f} g
-            
-            3. Total Mass Loading = (Coating Mass × 1000) / Area  
-               = {(mass_g - foil_mass) if 'mass_g' in locals() else (0.0200 - foil_mass):.6f} × 1000 / {mm_diameter_to_area_cm2(diameter_mm if 'diameter_mm' in locals() else 13.0):.4f}  
-               = {total_ml if 'total_ml' in locals() else ((0.0200 - foil_mass)*1000/mm_diameter_to_area_cm2(13.0)):.2f} mg/cm²
-            
-            4. Active Mass Loading = Total ML × (Active % / 100)  
-               = {total_ml if 'total_ml' in locals() else ((0.0200 - foil_mass)*1000/mm_diameter_to_area_cm2(13.0)):.2f} × ({active_pct if 'active_pct' in locals() else 96.0}/100)  
-               = {active_ml if 'active_ml' in locals() else ((0.0200 - foil_mass)*1000/mm_diameter_to_area_cm2(13.0)*(96.0/100)):.2f} mg/cm²
-            """)
-        else:
-            st.markdown("""
-            **Warning:** Substrate not recognized - using total disk mass for calculations.
-            
-            1. Area = π × (diameter/2)² / 100  
-               = π × (13.00/2)² / 100  
-               = 1.3273 cm²
-            
-            2. Total Mass Loading = (Disk Mass × 1000) / Area  
-               = (0.0200 × 1000) / 1.3273  
-               = 15.07 mg/cm²
-            
-            3. Active Mass Loading = Total ML × (Active % / 100)  
-               = 15.07 × (96/100)  
-               = 14.47 mg/cm²
-            """)
-
-    # Rest of your function remains the same...
-    st.subheader("Edit / Delete Rows")
+    # Quick stats at the top
     if not db.empty:
-        db_edit = db.copy()
-        db_edit = st.dataframe(db_edit, use_container_width=True)
-        # Simple delete by index
-        del_idx = st.number_input("Delete row index", min_value=0, max_value=max(len(db)-1, 0), value=0, step=1)
-        if st.button("Delete row"):
-            db2 = load_database(db_file)
-            if 0 <= del_idx < len(db2):
-                db2 = db2.drop(db2.index[del_idx]).reset_index(drop=True)
-                save_database(db2, db_file)
-                st.success(f"Deleted row {del_idx}.")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("📊 Total Electrodes", len(db))
+        with col2:
+            st.metric("🧪 Materials", db["Active Material"].nunique())
+        with col3:
+            st.metric("🗃️ Substrates", db["Substrate"].nunique())
+        with col4:
+            recent_count = len(db[db["Date Made"].notna()]) if "Date Made" in db.columns else 0
+            st.metric("📅 With Dates", recent_count)
+
+    # Tabbed interface
+    tab1, tab2, tab3 = st.tabs(["🔍 Add Electrodes", "📋 View & Edit", "📤 Import/Export"])
+
+    with tab1:
+        st.subheader("Add New Electrode")
+        
+        # Initialize session state for form persistence
+        if "form_data" not in st.session_state:
+            st.session_state.form_data = {
+                "custom_material": False,
+                "active_material": "LVP",
+                "material_key": "LVP",
+                "active_pct": 96.0,
+                "electrode_type": "Cathode",
+                "substrate": "Aluminum Foil",
+                "custom_substrate": False,
+                "custom_substrate_name": "",
+                "custom_tare": 4.163,
+                "diameter": 13.0,
+                "mass": 0.02,
+                "solid_pct": 30.0,
+                "blade_height": 200.0,
+                "date_made": datetime.now().date(),
+                "made_by": "",
+                "notes": ""
+            }
+
+        # Essential inputs (always visible)
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            electrode_type = st.selectbox(
+                "Electrode Type", 
+                ["Cathode", "Anode"],
+                index=0 if st.session_state.form_data["electrode_type"] == "Cathode" else 1
+            )
+            st.session_state.form_data["electrode_type"] = electrode_type
+        
+        with col2:
+            diameter = st.number_input(
+                "Diameter (mm)", 
+                1.0, 50.0, 
+                st.session_state.form_data["diameter"], 
+                0.1
+            )
+            st.session_state.form_data["diameter"] = diameter
+        
+        with col3:
+            mass = st.number_input(
+                "Total Mass (g)", 
+                0.0, 1.0, 
+                st.session_state.form_data["mass"], 
+                0.0001, 
+                format="%.5f"
+            )
+            st.session_state.form_data["mass"] = mass
+
+        # Material Properties (expandable)
+        with st.expander("🧪 Material Properties", expanded=True):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                material_source = st.radio(
+                    "Material Source",
+                    ["📚 Library", "✏️ Custom"],
+                    index=0 if not st.session_state.form_data["custom_material"] else 1,
+                    horizontal=True
+                )
+                st.session_state.form_data["custom_material"] = (material_source == "✏️ Custom")
+                
+                if material_source == "✏️ Custom":
+                    active_material = st.text_input(
+                        "Active Material", 
+                        value=st.session_state.form_data["active_material"] if st.session_state.form_data["custom_material"] else "",
+                        placeholder="e.g., Custom LFP"
+                    )
+                    st.session_state.form_data["active_material"] = active_material
+                else:
+                    available_materials = list(MATERIAL_LIBRARY.keys())
+                    try:
+                        current_idx = available_materials.index(st.session_state.form_data["material_key"])
+                    except (ValueError, KeyError):
+                        current_idx = 0
+                    
+                    material_key = st.selectbox(
+                        "Active Material", 
+                        available_materials,
+                        index=current_idx
+                    )
+                    st.session_state.form_data["material_key"] = material_key
+                    active_material = material_key
+                    st.session_state.form_data["active_material"] = active_material
+                    
+                    if material_key in MATERIAL_LIBRARY:
+                        material_info = MATERIAL_LIBRARY[material_key]
+                        st.caption(f"📖 {material_info['type']} | {material_info['capacity']} mAh/g | Typical: {material_info['active_pct']}%")
+            
+            with col2:
+                active_pct = st.number_input(
+                    "Active Material %", 
+                    0.0, 100.0, 
+                    st.session_state.form_data["active_pct"], 
+                    0.1
+                )
+                st.session_state.form_data["active_pct"] = active_pct
+
+        # Substrate Properties (expandable)
+        with st.expander("🗃️ Substrate Properties", expanded=False):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                substrate_source = st.radio(
+                    "Substrate Source",
+                    ["📚 Standard", "✏️ Custom"],
+                    index=0 if not st.session_state.form_data["custom_substrate"] else 1,
+                    horizontal=True
+                )
+                st.session_state.form_data["custom_substrate"] = (substrate_source == "✏️ Custom")
+                
+                if substrate_source == "✏️ Custom":
+                    custom_substrate_name = st.text_input(
+                        "Custom Substrate",
+                        value=st.session_state.form_data["custom_substrate_name"],
+                        placeholder="e.g., Special Copper"
+                    )
+                    st.session_state.form_data["custom_substrate_name"] = custom_substrate_name
+                    substrate_name = custom_substrate_name
+                else:
+                    substrate_options = list(SUBSTRATE_LIBRARY.keys())
+                    try:
+                        current_idx = substrate_options.index(st.session_state.form_data["substrate"])
+                    except (ValueError, KeyError):
+                        current_idx = 0
+                    
+                    substrate = st.selectbox(
+                        "Standard Substrate",
+                        substrate_options,
+                        index=current_idx
+                    )
+                    st.session_state.form_data["substrate"] = substrate
+                    substrate_name = substrate
+                    
+                    if substrate in SUBSTRATE_LIBRARY:
+                        substrate_info = SUBSTRATE_LIBRARY[substrate]
+                        st.caption(f"📋 {substrate_info['tare_mg_cm2']:.3f} mg/cm² | {substrate_info['type']}")
+            
+            with col2:
+                if substrate_source == "✏️ Custom":
+                    custom_tare = st.number_input(
+                        "Substrate Tare (mg/cm²)",
+                        0.0, 50.0,
+                        st.session_state.form_data["custom_tare"],
+                        0.001,
+                        format="%.5f"
+                    )
+                    st.session_state.form_data["custom_tare"] = custom_tare
+                else:
+                    if st.session_state.form_data["substrate"] in SUBSTRATE_LIBRARY:
+                        tare_value = SUBSTRATE_LIBRARY[st.session_state.form_data["substrate"]]["tare_mg_cm2"]
+                        st.metric("Substrate Tare", f"{tare_value:.3f} mg/cm²")
+
+        # Processing Parameters (expandable)
+        with st.expander("⚙️ Processing Parameters", expanded=False):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                solid_pct = st.number_input(
+                    "Slurry Solid Content (%)", 
+                    0.0, 100.0, 
+                    st.session_state.form_data["solid_pct"], 
+                    0.1
+                )
+                st.session_state.form_data["solid_pct"] = solid_pct
+            
+            with col2:
+                blade_height = st.number_input(
+                    "Blade Height (µm)", 
+                    1.0, 1000.0, 
+                    st.session_state.form_data["blade_height"], 
+                    1.0
+                )
+                st.session_state.form_data["blade_height"] = blade_height
+
+        # Additional Info (expandable)
+        with st.expander("📋 Additional Information", expanded=False):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                date_made = st.date_input(
+                    "Date Made",
+                    value=st.session_state.form_data["date_made"]
+                )
+                st.session_state.form_data["date_made"] = date_made
+                
+                made_by = st.text_input(
+                    "Made By",
+                    value=st.session_state.form_data["made_by"],
+                    placeholder="Initials"
+                )
+                st.session_state.form_data["made_by"] = made_by
+            
+            with col2:
+                notes = st.text_area(
+                    "Notes", 
+                    value=st.session_state.form_data["notes"],
+                    placeholder="Optional notes...",
+                    height=80
+                )
+                st.session_state.form_data["notes"] = notes
+
+        # Mass loading preview (always visible but compact)
+        try:
+            if substrate_source == "✏️ Custom":
+                area_cm2 = mm_diameter_to_area_cm2(diameter)
+                substrate_mass_g = (custom_tare / 1000.0) * area_cm2
+                substrate_display = f"{custom_substrate_name} ({custom_tare:.3f} mg/cm²)"
             else:
-                st.error("Invalid index.")
+                substrate_mass_g = get_substrate_mass_g(substrate_name, diameter)
+                if substrate_name in SUBSTRATE_LIBRARY:
+                    tare_val = SUBSTRATE_LIBRARY[substrate_name]["tare_mg_cm2"]
+                    substrate_display = f"{substrate_name} ({tare_val:.3f} mg/cm²)"
+                else:
+                    substrate_display = substrate_name
+            
+            total_ml, active_ml = calc_mass_loading_total_and_active(
+                mass, diameter, substrate_mass_g, active_pct
+            )
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total ML", f"{total_ml:.2f} mg/cm²")
+            with col2:
+                st.metric("Active ML", f"{active_ml:.2f} mg/cm²")
+            with col3:
+                area_cm2 = mm_diameter_to_area_cm2(diameter)
+                st.metric("Area", f"{area_cm2:.3f} cm²")
+                
+            # Expandable calculation details
+            with st.expander("📊 Calculation Details", expanded=False):
+                st.info(f"""
+                **Calculation Summary:**
+                - Substrate: {substrate_display}
+                - Electrode: Ø{diameter:.1f} mm ({area_cm2:.3f} cm²)
+                - Total mass: {mass:.5f} g
+                - Substrate mass: {substrate_mass_g*1000:.2f} mg
+                - Coating mass: {(mass-substrate_mass_g)*1000:.2f} mg
+                - Active material: {active_pct:.1f}% of coating
+                """)
+                
+        except Exception as e:
+            st.error(f"⚠️ Calculation error: {e}")
+            total_ml, active_ml = 0.0, 0.0
 
-    st.subheader("Export")
-    db_current = pd.read_excel(db_file)
+        # Action buttons
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            submit_button = st.button(
+                "💾 Add to Database", 
+                use_container_width=True, 
+                type="primary"
+            )
+        
+        with col2:
+            reset_button = st.button(
+                "🔄 Reset", 
+                use_container_width=True
+            )
 
-    from difflib import get_close_matches
+        # Handle buttons
+        if reset_button:
+            st.session_state.form_data = {
+                "custom_material": False,
+                "active_material": "LVP",
+                "material_key": "LVP", 
+                "active_pct": 96.0,
+                "electrode_type": "Cathode",
+                "substrate": "Aluminum Foil",
+                "custom_substrate": False,
+                "custom_substrate_name": "",
+                "custom_tare": 4.163,
+                "diameter": 13.0,
+                "mass": 0.02,
+                "solid_pct": 30.0,
+                "blade_height": 200.0,
+                "date_made": datetime.now().date(),
+                "made_by": "",
+                "notes": ""
+            }
+            st.rerun()
 
-    valid_active_materials = ['LVP', 'NVP', 'Li3V2(PO4)3', 'Na3V2(PO4)3', 'graphite', 'hard-carbon']
-    valid_substrates = ['aluminum', 'copper', 'hard-carbon']
+        if submit_button:
+            if not active_material.strip():
+                st.error("❌ Please enter an active material name.")
+                return
+                
+            if substrate_source == "✏️ Custom" and not custom_substrate_name.strip():
+                st.error("❌ Please enter a custom substrate name.")
+                return
+                
+            try:
+                # Calculate mass loadings
+                if substrate_source == "✏️ Custom":
+                    area_cm2 = mm_diameter_to_area_cm2(diameter)
+                    substrate_mass_g = (custom_tare / 1000.0) * area_cm2
+                    final_substrate_name = custom_substrate_name
+                else:
+                    substrate_mass_g = get_substrate_mass_g(substrate_name, diameter)
+                    final_substrate_name = substrate_name
+                
+                total_ml, active_ml = calc_mass_loading_total_and_active(
+                    mass, diameter, substrate_mass_g, active_pct
+                )
+                
+                # Create new row
+                new_row = {
+                    "Active Material": active_material,
+                    "Substrate": final_substrate_name,
+                    "Diameter (mm)": diameter,
+                    "Mass (g)": mass,
+                    "Solid %": solid_pct,
+                    "Blade Height (µm)": blade_height,
+                    "Active Material %": active_pct,
+                    "Mass Loading (mg/cm²)": total_ml,
+                    "Active ML (mg/cm²)": active_ml,
+                    "Date Made": str(date_made),
+                    "Made By": made_by,
+                    "Notes": notes
+                }
+                
+                # Add to database
+                db_new = pd.concat([db, pd.DataFrame([new_row])], ignore_index=True)
+                db_new = ensure_db_columns(db_new)
+                save_database(db_new, db_file)
+                
+                st.success(f"✅ Added {active_material} electrode!")
+                
+                # Show what was added in expander
+                with st.expander("📋 Added Details", expanded=False):
+                    st.json(new_row)
+                    
+            except Exception as e:
+                st.error(f"❌ Failed to add electrode: {str(e)}")
 
-    def autocorrect_value(value, valid_list):
-        if pd.isna(value):
-            return value, None
-        value_str = str(value).strip()
-        match = get_close_matches(value_str.lower(), [v.lower() for v in valid_list], n=1, cutoff=0.6)
-        if match:
-            corrected = next(v for v in valid_list if v.lower() == match[0])
-            if corrected != value_str:
-                return corrected, f"Corrected '{value_str}' to '{corrected}'"
-        return value_str, None
+    with tab2:
+        st.subheader("📋 Database Contents")
+        
+        if db.empty:
+            st.info("🔭 No electrodes yet. Add some in the 'Add Electrodes' tab!")
+        else:
+            # Compact filters in expander
+            with st.expander("🔍 Filters", expanded=False):
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    search_material = st.selectbox(
+                        "Material", 
+                        ["All"] + sorted(db["Active Material"].dropna().unique().tolist())
+                    )
+                
+                with col2:
+                    search_substrate = st.selectbox(
+                        "Substrate",
+                        ["All"] + sorted(db["Substrate"].dropna().unique().tolist())
+                    )
+                    
+                with col3:
+                    search_person = st.selectbox(
+                        "Made By",
+                        ["All"] + sorted([p for p in db["Made By"].dropna().unique() if str(p).strip()])
+                    )
 
-    corrections_log = []
+            # Apply filters
+            filtered_db = db.copy()
+            if search_material != "All":
+                filtered_db = filtered_db[filtered_db["Active Material"] == search_material]
+            if search_substrate != "All":
+                filtered_db = filtered_db[filtered_db["Substrate"] == search_substrate]
+            if search_person != "All":
+                filtered_db = filtered_db[filtered_db["Made By"] == search_person]
 
-    for col, valid_list in [('Active Material', valid_active_materials), ('Substrate', valid_substrates)]:
-        for idx, val in enumerate(db_current[col]):
-            corrected_val, note = autocorrect_value(val, valid_list)
-            db_current.at[idx, col] = corrected_val
-            if note:
-                corrections_log.append({'Row': idx + 2, 'Column': col, 'Note': note})
-    data_bytes, fname = bytes_excel(db_current, filename=os.path.basename(db_file))
-    st.download_button("Download current database (.xlsx)", data=data_bytes, file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.caption(f"Showing {len(filtered_db)} of {len(db)} electrodes")
+
+            # Display table
+            if not filtered_db.empty:
+                display_df = filtered_db.copy()
+                
+                # Format numeric columns
+                numeric_cols = ["Mass (g)", "Mass Loading (mg/cm²)", "Active ML (mg/cm²)"]
+                for col in numeric_cols:
+                    if col in display_df.columns:
+                        display_df[col] = pd.to_numeric(display_df[col], errors="coerce").map(
+                            lambda x: f"{x:.3f}" if pd.notnull(x) else ""
+                        )
+                
+                st.dataframe(display_df, use_container_width=True, height=300)
+
+                # Compact delete in expander
+                with st.expander("🗑️ Delete Electrode", expanded=False):
+                    if len(filtered_db) > 0:
+                        delete_options = []
+                        for idx, row in filtered_db.iterrows():
+                            material = row.get("Active Material", "Unknown")
+                            substrate = row.get("Substrate", "Unknown")  
+                            date = row.get("Date Made", "No date")
+                            delete_options.append(f"Row {idx}: {material} on {substrate} ({date})")
+                        
+                        to_delete = st.selectbox("Select:", ["Select..."] + delete_options)
+                        
+                        if to_delete != "Select..." and st.button("🗑️ Delete", type="secondary"):
+                            try:
+                                row_idx = int(to_delete.split(":")[0].replace("Row ", ""))
+                                db_updated = db.drop(row_idx).reset_index(drop=True)
+                                save_database(db_updated, db_file)
+                                st.success("✅ Deleted!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Delete failed: {e}")
+
+    with tab3:
+        st.subheader("📤 Import & Export")
+        
+        # Import section in expander
+        with st.expander("📥 Import Database", expanded=False):
+            uploaded_file = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
+            
+            if uploaded_file is not None:
+                try:
+                    new_db = pd.read_excel(uploaded_file)
+                    new_db = ensure_db_columns(new_db)
+                    
+                    st.write("Preview:")
+                    st.dataframe(new_db.head(3))
+                    
+                    import_mode = st.radio("Mode:", ["Replace database", "Add to existing"])
+                    
+                    if st.button("📥 Import"):
+                        if import_mode == "Replace database":
+                            save_database(new_db, db_file)
+                            st.success(f"✅ Replaced! Imported {len(new_db)} electrodes.")
+                        else:
+                            combined_db = pd.concat([db, new_db], ignore_index=True)
+                            combined_db = ensure_db_columns(combined_db)
+                            save_database(combined_db, db_file)
+                            st.success(f"✅ Added {len(new_db)} electrodes!")
+                        st.rerun()
+                        
+                except Exception as e:
+                    st.error(f"❌ Import failed: {e}")
+        
+        # Export section
+        with st.expander("📤 Export Database", expanded=True if not db.empty else False):
+            if not db.empty:
+                export_filtered = st.checkbox("Export filtered data only", value=False)
+                
+                if export_filtered and 'filtered_db' in locals():
+                    export_db = filtered_db
+                    st.info(f"Will export {len(export_db)} filtered electrodes")
+                else:
+                    export_db = db
+                    st.info(f"Will export all {len(export_db)} electrodes")
+
+                try:
+                    excel_bytes, filename = bytes_excel(export_db, "electrode_database.xlsx")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.download_button(
+                            label="📥 Excel",
+                            data=excel_bytes,
+                            file_name=filename,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+                    
+                    with col2:
+                        csv_data = export_db.to_csv(index=False)
+                        st.download_button(
+                            label="📄 CSV",
+                            data=csv_data,
+                            file_name="electrode_database.csv", 
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                        
+                except Exception as e:
+                    st.error(f"❌ Export failed: {e}")
+            else:
+                st.info("🔭 No data to export")
+
+        # Database statistics in expander
+        if not db.empty:
+            with st.expander("📊 Database Statistics", expanded=False):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown("**Materials:**")
+                    material_counts = db["Active Material"].value_counts()
+                    for material, count in material_counts.head(5).items():
+                        st.write(f"• {material}: {count}")
+                
+                with col2:
+                    st.markdown("**Substrates:**")
+                    substrate_counts = db["Substrate"].value_counts()
+                    for substrate, count in substrate_counts.head(5).items():
+                        st.write(f"• {substrate}: {count}")
+
+
+def electrode_database_manager():
+    st.title("🗄️ ElectroDB - Electrode Database Manager")
+    st.caption("Streamlined electrode data management for battery researchers")
+
+    # Load database
+    db = load_database(db_file)
+
+    # Quick stats at the top
+    if not db.empty:
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("📊 Total Electrodes", len(db))
+        with col2:
+            st.metric("🧪 Materials", db["Active Material"].nunique())
+        with col3:
+            st.metric("🗃️ Substrates", db["Substrate"].nunique())
+        with col4:
+            recent_count = len(db[db["Date Made"].notna()]) if "Date Made" in db.columns else 0
+            st.metric("📅 With Dates", recent_count)
+
+    # Tabbed interface
+    tab1, tab2, tab3 = st.tabs(["🔍 Add Electrodes", "📋 View & Edit", "📤 Import/Export"])
+
+    with tab1:
+        st.subheader("Add New Electrode")
+        
+        # Initialize session state for form persistence
+        if "form_data" not in st.session_state:
+            st.session_state.form_data = {
+                "custom_material": False,
+                "active_material": "LVP",
+                "material_key": "LVP",
+                "active_pct": 96.0,
+                "electrode_type": "Cathode",
+                "substrate": "Aluminum Foil",
+                "custom_substrate": False,
+                "custom_substrate_name": "",
+                "custom_tare": 4.163,
+                "diameter": 13.0,
+                "mass": 0.02,
+                "solid_pct": 30.0,
+                "blade_height": 200.0,
+                "date_made": datetime.now().date(),
+                "made_by": "",
+                "notes": ""
+            }
+
+        # --- Essential Inputs ---
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            electrode_type = st.selectbox(
+                "Electrode Type", ["Cathode", "Anode"],
+                index=0 if st.session_state.form_data["electrode_type"]=="Cathode" else 1
+            )
+            st.session_state.form_data["electrode_type"] = electrode_type
+        with col2:
+            diameter = st.number_input(
+                "Diameter (mm)", 1.0, 50.0, st.session_state.form_data["diameter"], 0.1
+            )
+            st.session_state.form_data["diameter"] = diameter
+        with col3:
+            mass = st.number_input(
+                "Total Mass (g)", 0.0, 1.0, st.session_state.form_data["mass"], 0.0001, format="%.5f"
+            )
+            st.session_state.form_data["mass"] = mass
+
+        # --- Material Properties ---
+        with st.expander("🧪 Material Properties", expanded=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                material_source = st.radio(
+                    "Material Source", ["📚 Library", "✏️ Custom"],
+                    index=0 if not st.session_state.form_data["custom_material"] else 1, horizontal=True
+                )
+                st.session_state.form_data["custom_material"] = (material_source=="✏️ Custom")
+                if material_source=="✏️ Custom":
+                    active_material = st.text_input(
+                        "Active Material", value=st.session_state.form_data["active_material"], placeholder="e.g., Custom LFP"
+                    )
+                    st.session_state.form_data["active_material"] = active_material
+                else:
+                    available_materials = list(MATERIAL_LIBRARY.keys())
+                    try:
+                        current_idx = available_materials.index(st.session_state.form_data["material_key"])
+                    except (ValueError, KeyError):
+                        current_idx = 0
+                    material_key = st.selectbox(
+                        "Active Material", available_materials, index=current_idx
+                    )
+                    st.session_state.form_data["material_key"] = material_key
+                    active_material = material_key
+                    st.session_state.form_data["active_material"] = active_material
+                    if material_key in MATERIAL_LIBRARY:
+                        material_info = MATERIAL_LIBRARY[material_key]
+                        st.caption(f"📖 {material_info['type']} | {material_info['capacity']} mAh/g | Typical: {material_info['active_pct']}%")
+            with col2:
+                active_pct = st.number_input(
+                    "Active Material %", 0.0, 100.0, st.session_state.form_data["active_pct"], 0.1
+                )
+                st.session_state.form_data["active_pct"] = active_pct
+
+        # --- Substrate Properties ---
+        with st.expander("🗃️ Substrate Properties", expanded=False):
+            col1, col2 = st.columns(2)
+            with col1:
+                substrate_source = st.radio(
+                    "Substrate Source", ["📚 Standard","✏️ Custom"],
+                    index=0 if not st.session_state.form_data["custom_substrate"] else 1, horizontal=True
+                )
+                st.session_state.form_data["custom_substrate"] = (substrate_source=="✏️ Custom")
+                if substrate_source=="✏️ Custom":
+                    custom_substrate_name = st.text_input(
+                        "Custom Substrate", value=st.session_state.form_data["custom_substrate_name"], placeholder="e.g., Special Copper"
+                    )
+                    st.session_state.form_data["custom_substrate_name"] = custom_substrate_name
+                    substrate_name = custom_substrate_name
+                else:
+                    substrate_options = list(SUBSTRATE_LIBRARY.keys())
+                    try:
+                        current_idx = substrate_options.index(st.session_state.form_data["substrate"])
+                    except (ValueError, KeyError):
+                        current_idx = 0
+                    substrate = st.selectbox(
+                        "Standard Substrate", substrate_options, index=current_idx
+                    )
+                    st.session_state.form_data["substrate"] = substrate
+                    substrate_name = substrate
+                    if substrate in SUBSTRATE_LIBRARY:
+                        substrate_info = SUBSTRATE_LIBRARY[substrate]
+                        st.caption(f"📋 {substrate_info['tare_mg_cm2']:.3f} mg/cm² | {substrate_info['type']}")
+            with col2:
+                if substrate_source=="✏️ Custom":
+                    custom_tare = st.number_input(
+                        "Substrate Tare (mg/cm²)", 0.0, 50.0, st.session_state.form_data["custom_tare"], 0.001, format="%.5f"
+                    )
+                    st.session_state.form_data["custom_tare"] = custom_tare
+                else:
+                    if substrate_name in SUBSTRATE_LIBRARY:
+                        st.metric("Substrate Tare", f"{SUBSTRATE_LIBRARY[substrate_name]['tare_mg_cm2']:.3f} mg/cm²")
+
+        # --- Processing Parameters ---
+        with st.expander("⚙️ Processing Parameters", expanded=False):
+            col1, col2 = st.columns(2)
+            with col1:
+                solid_pct = st.number_input("Slurry Solid Content (%)",0.0,100.0,st.session_state.form_data["solid_pct"],0.1)
+                st.session_state.form_data["solid_pct"] = solid_pct
+            with col2:
+                blade_height = st.number_input("Blade Height (µm)",1.0,1000.0,st.session_state.form_data["blade_height"],1.0)
+                st.session_state.form_data["blade_height"] = blade_height
+
+        # --- Additional Info ---
+        with st.expander("📋 Additional Information", expanded=False):
+            col1, col2 = st.columns(2)
+            with col1:
+                date_made = st.date_input("Date Made", value=st.session_state.form_data["date_made"])
+                st.session_state.form_data["date_made"] = date_made
+                made_by = st.text_input("Made By", value=st.session_state.form_data["made_by"], placeholder="Initials")
+                st.session_state.form_data["made_by"] = made_by
+            with col2:
+                notes = st.text_area("Notes", value=st.session_state.form_data["notes"], placeholder="Optional notes...", height=80)
+                st.session_state.form_data["notes"] = notes
+
+        # --- Mass loading preview ---
+
+        # Initialize defaults
+        area_cm2 = 0.0
+        tare_mg_cm2 = 0.0
+        total_ml = 0.0
+        active_ml = 0.0
+        try:
+            if substrate_source=="✏️ Custom":
+                area_cm2 = mm_diameter_to_area_cm2(diameter)
+                substrate_mass_g = (custom_tare/1000.0)*area_cm2
+                substrate_display = f"{custom_substrate_name} ({custom_tare:.3f} mg/cm²)"
+                tare_mg_cm2 = custom_tare
+            else:
+                substrate_mass_g = get_substrate_mass_g(substrate_name, diameter)
+                if substrate_name in SUBSTRATE_LIBRARY:
+                    tare_val = SUBSTRATE_LIBRARY[substrate_name]["tare_mg_cm2"]
+                    substrate_display = f"{substrate_name} ({tare_val:.3f} mg/cm²)"
+                    tare_mg_cm2 = tare_val
+                else:
+                    substrate_display = substrate_name
+                    tare_mg_cm2 = 0.0
+            total_ml, active_ml = calc_mass_loading_total_and_active(mass, diameter, substrate_mass_g, active_pct)
+            col1, col2, col3 = st.columns(3)
+            with col1: st.metric("Total ML", f"{total_ml:.2f} mg/cm²")
+            with col2: st.metric("Active ML", f"{active_ml:.2f} mg/cm²")
+            with col3: st.metric("Area", f"{area_cm2:.3f} cm²")
+            with st.expander("📊 Calculation Details", expanded=False):
+                st.info(f"""
+                **Calculation Summary:**
+                - Substrate: {substrate_display}
+                - Tare Weight Used: {tare_mg_cm2:.3f} mg/cm²
+                - Electrode: Ø{diameter:.1f} mm ({area_cm2:.3f} cm²)
+                - Total mass: {mass:.5f} g
+                - Substrate mass: {substrate_mass_g*1000:.2f} mg
+                - Coating mass: {(mass-substrate_mass_g)*1000:.2f} mg
+                - Active material: {active_pct:.1f}% of coating
+                """)
+        except Exception as e:
+            st.error(f"⚠️ Calculation error: {e}")
+            total_ml, active_ml, tare_mg_cm2 = 0.0,0.0,0.0
+
+        # --- Buttons ---
+        col1, col2 = st.columns([3,1])
+        with col1:
+            submit_button = st.button("💾 Add to Database", use_container_width=True, type="primary")
+        with col2:
+            reset_button = st.button("🔄 Reset", use_container_width=True)
+
+        if reset_button:
+            st.session_state.form_data = {
+                "custom_material": False, "active_material": "LVP", "material_key": "LVP",
+                "active_pct": 96.0, "electrode_type": "Cathode", "substrate": "Aluminum Foil",
+                "custom_substrate": False, "custom_substrate_name": "", "custom_tare": 4.163,
+                "diameter": 13.0, "mass": 0.02, "solid_pct": 30.0, "blade_height": 200.0,
+                "date_made": datetime.now().date(), "made_by": "", "notes": ""
+            }
+            st.rerun()
+
+        if submit_button:
+            if not active_material.strip(): st.error("❌ Please enter an active material name."); return
+            if substrate_source=="✏️ Custom" and not custom_substrate_name.strip(): st.error("❌ Please enter a custom substrate name."); return
+            try:
+                if substrate_source=="✏️ Custom":
+                    area_cm2 = mm_diameter_to_area_cm2(diameter)
+                    substrate_mass_g = (custom_tare/1000.0)*area_cm2
+                    final_substrate_name = custom_substrate_name
+                    tare_mg_cm2 = custom_tare
+                else:
+                    substrate_mass_g = get_substrate_mass_g(substrate_name, diameter)
+                    final_substrate_name = substrate_name
+                    tare_mg_cm2 = SUBSTRATE_LIBRARY[substrate_name]["tare_mg_cm2"] if substrate_name in SUBSTRATE_LIBRARY else 0.0
+                total_ml, active_ml = calc_mass_loading_total_and_active(mass, diameter, substrate_mass_g, active_pct)
+                new_row = {
+                    "Electrode Type": electrode_type,
+                    "Active Material": active_material,
+                    "Substrate": final_substrate_name,
+                    "Tare Weight (mg/cm²)": tare_mg_cm2,
+                    "Mass (g)": mass,
+                    "Diameter (mm)": diameter,
+                    "Solid %": solid_pct,
+                    "Blade Height (µm)": blade_height,
+                    "Active Material %": active_pct,
+                    "Mass Loading (mg/cm²)": total_ml,
+                    "Active ML (mg/cm²)": active_ml,
+                    "Date Made": str(date_made),
+                    "Made By": made_by,
+                    "Notes": notes
+                }
+                db_new = pd.concat([db, pd.DataFrame([new_row])], ignore_index=True)
+                db_new = ensure_db_columns(db_new)
+                save_database(db_new, db_file)
+                st.success(f"✅ Added {active_material} electrode!")
+                with st.expander("📋 Added Details", expanded=False):
+                    st.json(new_row)
+            except Exception as e:
+                st.error(f"❌ Failed to add electrode: {str(e)}")
+
+    # --- Tab 2: View/Edit Display ---
+    with tab2:
+        st.subheader("📋 Database Contents")
+        if db.empty:
+            st.info("🔭 No electrodes yet. Add some in the 'Add Electrodes' tab!")
+        else:
+            # Filters
+            with st.expander("🔍 Filters", expanded=False):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    search_material = st.selectbox("Material", ["All"] + sorted(db["Active Material"].dropna().unique().tolist()))
+                with col2:
+                    search_substrate = st.selectbox("Substrate", ["All"] + sorted(db["Substrate"].dropna().unique().tolist()))
+                with col3:
+                    search_person = st.selectbox("Made By", ["All"] + sorted([p for p in db["Made By"].dropna().unique() if str(p).strip()]))
+            filtered_db = db.copy()
+            if search_material != "All": filtered_db = filtered_db[filtered_db["Active Material"]==search_material]
+            if search_substrate != "All": filtered_db = filtered_db[filtered_db["Substrate"]==search_substrate]
+            if search_person != "All": filtered_db = filtered_db[filtered_db["Made By"]==search_person]
+            st.caption(f"Showing {len(filtered_db)} of {len(db)} electrodes")
+            if not filtered_db.empty:
+                display_df = filtered_db.copy()
+                numeric_cols = ["Mass (g)", "Mass Loading (mg/cm²)", "Active ML (mg/cm²)", "Tare Weight (mg/cm²)"]
+                for col in numeric_cols:
+                    if col in display_df.columns:
+                        display_df[col] = pd.to_numeric(display_df[col], errors="coerce").map(lambda x:f"{x:.3f}" if pd.notnull(x) else "")
+                st.dataframe(display_df, use_container_width=True, height=300)
+
+                # Delete section
+                with st.expander("🗑️ Delete Electrode", expanded=False):
+                    if len(filtered_db)>0:
+                        delete_options=[]
+                        for idx,row in filtered_db.iterrows():
+                            material=row.get("Active Material","Unknown")
+                            substrate=row.get("Substrate","Unknown")
+                            date=row.get("Date Made","No date")
+                            delete_options.append(f"Row {idx}: {material} on {substrate} ({date})")
+                        to_delete=st.selectbox("Select:", ["Select..."]+delete_options)
+                        if to_delete!="Select..." and st.button("🗑️ Delete", type="secondary"):
+                            try:
+                                row_idx=int(to_delete.split(":")[0].replace("Row ",""))
+                                db_updated=db.drop(row_idx).reset_index(drop=True)
+                                save_database(db_updated, db_file)
+                                st.success("✅ Deleted!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ Delete failed: {e}")
+
+    # --- Tab 3: Import/Export ---
+    with tab3:
+        st.subheader("📤 Import & Export")
+        # Import
+        with st.expander("📥 Import Database", expanded=False):
+            uploaded_file = st.file_uploader("Upload Excel file (.xlsx)", type=["xlsx"])
+            if uploaded_file is not None:
+                try:
+                    new_db = pd.read_excel(uploaded_file)
+                    new_db = ensure_db_columns(new_db)
+                    st.dataframe(new_db.head(3))
+                    import_mode = st.radio("Mode:", ["Replace database", "Add to existing"])
+                    if st.button("📥 Import"):
+                        if import_mode=="Replace database": save_database(new_db, db_file)
+                        else:
+                            combined_db=pd.concat([db,new_db],ignore_index=True)
+                            combined_db=ensure_db_columns(combined_db)
+                            save_database(combined_db, db_file)
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Import failed: {e}")
+
+        # Export
+        with st.expander("📤 Export Database", expanded=True if not db.empty else False):
+            if not db.empty:
+                export_filtered=st.checkbox("Export filtered data only", value=False)
+                export_db = filtered_db if export_filtered and 'filtered_db' in locals() else db
+                export_columns=[
+                    "Electrode Type","Active Material","Substrate","Tare Weight (mg/cm²)",
+                    "Mass (g)","Diameter (mm)","Solid %","Blade Height (µm)","Active Material %",
+                    "Mass Loading (mg/cm²)","Active ML (mg/cm²)","Date Made","Made By","Notes"
+                ]
+                export_db = export_db.reindex(columns=export_columns)
+                try:
+                    excel_bytes, filename = bytes_excel(export_db,"electrode_database.xlsx")
+                    col1,col2=st.columns(2)
+                    with col1:
+                        st.download_button("📥 Excel", excel_bytes, file_name=filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+                    with col2:
+                        csv_data=export_db.to_csv(index=False)
+                        st.download_button("📄 CSV", csv_data,file_name="electrode_database.csv",mime="text/csv", use_container_width=True)
+                except Exception as e:
+                    st.error(f"❌ Export failed: {e}")
+            else:
+                st.info("🔭 No data to export")
+
+        # Statistics
+        if not db.empty:
+            with st.expander("📊 Database Statistics", expanded=False):
+                col1,col2=st.columns(2)
+                with col1:
+                    st.markdown("**Materials:**")
+                    material_counts=db["Active Material"].value_counts()
+                    for material,count in material_counts.head(5).items(): st.write(f"• {material}: {count}")
+                with col2:
+                    st.markdown("**Substrates:**")
+                    substrate_counts=db["Substrate"].value_counts()
+                    for substrate,count in substrate_counts.head(5).items(): st.write(f"• {substrate}: {count}")
 
 
 # =========================
